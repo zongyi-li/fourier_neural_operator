@@ -17,6 +17,10 @@ from functools import partial
 from timeit import default_timer
 from utilities3 import *
 
+import tensorboardX
+from tensorboardX import SummaryWriter
+writer = SummaryWriter("./data/PytorchLogs/fourier_1D/")
+
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -115,7 +119,7 @@ class SimpleBlock1d(nn.Module):
         x2 = self.w2(x)
         x = self.bn2(x1 + x2)
         x = F.relu(x)
-        x1 = self.conv3(x)
+        x = self.conv3(x)
         x2 = self.w3(x)
         x = self.bn3(x1 + x2)
 
@@ -155,8 +159,8 @@ class Net1d(nn.Module):
 ntrain = 1000
 ntest = 100
 
-sub = 1 #subsampling rate
-h = 2**10 // sub
+sub = 2**3 #subsampling rate
+h = 2**13 // sub
 s = h
 
 batch_size = 20
@@ -173,7 +177,7 @@ width = 64
 ################################################################
 # read data
 ################################################################
-dataloader = MatReader('data/burgers_data_R10.mat')
+dataloader = MatReader('./data/burgers_data_R10.mat')
 x_data = dataloader.read_field('a')[:,::sub]
 y_data = dataloader.read_field('u')[:,::sub]
 
@@ -192,9 +196,11 @@ train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_trai
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=False)
 
 # model
-model = Net1d(modes, width).cuda()
+model = Net1d(modes, width).cpu()
 print(model.count_params())
 
+train_data_sample, label_sample = iter(train_loader).next()
+writer.add_graph(model, train_data_sample.to(device))  # model graph, with input
 
 ################################################################
 # training and evaluation
@@ -209,7 +215,7 @@ for ep in range(epochs):
     train_mse = 0
     train_l2 = 0
     for x, y in train_loader:
-        x, y = x.cuda(), y.cuda()
+        x, y = x.cpu(), y.cpu()
 
         optimizer.zero_grad()
         out = model(x)
@@ -223,12 +229,20 @@ for ep in range(epochs):
         train_mse += mse.item()
         train_l2 += l2.item()
 
+        # Record training loss from each epoch into the writer
+        writer.add_scalar('Train/Loss', l2.item(), ep)
+
+        # setup the summary writer
+        for name, param in model.named_parameters():
+            writer.add_histogram(name, param.clone().cpu().data.numpy(), ep)
+        writer.flush()
+
     scheduler.step()
     model.eval()
     test_l2 = 0.0
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.cuda(), y.cuda()
+            x, y = x.cpu(), y.cpu()
 
             out = model(x)
             test_l2 += myloss(out.view(batch_size, -1), y.view(batch_size, -1)).item()
@@ -247,7 +261,7 @@ test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test,
 with torch.no_grad():
     for x, y in test_loader:
         test_l2 = 0
-        x, y = x.cuda(), y.cuda()
+        x, y = x.cpu(), y.cpu()
 
         out = model(x)
         pred[index] = out
@@ -256,4 +270,5 @@ with torch.no_grad():
         print(index, test_l2)
         index = index + 1
 
-# scipy.io.savemat('pred/burger_test.mat', mdict={'pred': pred.cpu().numpy()})
+scipy.io.savemat('pred/burger_test.mat', mdict={'pred': pred.cpu().numpy()})
+writer.close()

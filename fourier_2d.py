@@ -18,6 +18,12 @@ from functools import partial
 from timeit import default_timer
 from utilities3 import *
 
+#from torch.utils.tensorboard import SummaryWriter
+
+import tensorboardX
+from tensorboardX import SummaryWriter
+writer = SummaryWriter("./data/PytorchLogs/fourier_2D/")
+
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -162,8 +168,8 @@ class Net2d(nn.Module):
 ################################################################
 # configs
 ################################################################
-TRAIN_PATH = 'data/piececonst_r421_N1024_smooth1.mat'
-TEST_PATH = 'data/piececonst_r421_N1024_smooth2.mat'
+TRAIN_PATH = './data/piececonst_r421_N1024_smooth1.mat'
+TEST_PATH = './data//piececonst_r421_N1024_smooth2.mat'
 
 ntrain = 1000
 ntest = 100
@@ -215,20 +221,22 @@ test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test,
 ################################################################
 # training and evaluation
 ################################################################
-model = Net2d(modes, width).cuda()
+model = Net2d(modes, width).cpu()
 print(model.count_params())
 
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
 
 myloss = LpLoss(size_average=False)
-y_normalizer.cuda()
+y_normalizer.cpu()
+train_data_sample, label_sample = iter(train_loader).next()
+writer.add_graph(model, train_data_sample.to(device))  # model graph, with input
 for ep in range(epochs):
     model.train()
     t1 = default_timer()
     train_mse = 0
     for x, y in train_loader:
-        x, y = x.cuda(), y.cuda()
+        x, y = x.cpu(), y.cpu()
 
         optimizer.zero_grad()
         # loss = F.mse_loss(model(x).view(-1), y.view(-1), reduction='mean')
@@ -238,9 +246,16 @@ for ep in range(epochs):
         loss = myloss(out.view(batch_size,-1), y.view(batch_size,-1))
         loss.backward()
 
-
         optimizer.step()
         train_mse += loss.item()
+
+    # Record training loss from each epoch into the writer
+        writer.add_scalar('Train/Loss', loss.item(), ep)
+
+        # setup the summary writer
+        for name, param in model.named_parameters():
+            writer.add_histogram(name, param.clone().cpu().data.numpy(), ep)
+        writer.flush()
 
     scheduler.step()
 
@@ -249,7 +264,7 @@ for ep in range(epochs):
     rel_err = 0.0
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.cuda(), y.cuda()
+            x, y = x.cpu(), y.cpu()
 
             out = model(x)
             out = y_normalizer.decode(model(x))
@@ -260,5 +275,12 @@ for ep in range(epochs):
     abs_err /= ntest
     rel_err /= ntest
 
+# Record loss and accuracy from the test run into the writer
+    writer.add_scalar('Test/Loss', abs_err, ep)
+    writer.add_scalar('Test/Accuracy', rel_err, ep)
+    writer.flush()
+
     t2 = default_timer()
     print(ep, t2-t1, train_mse, rel_err)
+
+writer.close()
