@@ -230,3 +230,17 @@ class DenseNet(torch.nn.Module):
             x = l(x)
 
         return x
+    
+def roll_n(X, axis, n):
+    f_idx = tuple(slice(None, None, None) if i != axis else slice(0, n, None)
+                  for i in range(X.dim()))
+    b_idx = tuple(slice(None, None, None) if i != axis else slice(n, None, None)
+                  for i in range(X.dim()))
+    front = X[f_idx]
+    back = X[b_idx]
+    return torch.cat([back, front], axis)
+
+def fftshift(data,dims=(2,3)):
+    for dim in dims:
+        data = roll_n(data, axis=dim, n=data.size(dim) // 2)
+    return data

@@ -51,10 +51,7 @@ class SpectralConv3d_fast(nn.Module):
         self.modes3 = modes3
 
         self.scale = (1 / (in_channels * out_channels))
-        self.weights1 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, 2))
-        self.weights2 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, 2))
-        self.weights3 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, 2))
-        self.weights4 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, self.modes3, 2))
+        self.weights = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1*2, self.modes2*2, self.modes3, 2))
 
     def forward(self, x):
         batchsize = x.shape[0]
@@ -63,14 +60,13 @@ class SpectralConv3d_fast(nn.Module):
 
         # Multiply relevant Fourier modes
         out_ft = torch.zeros(batchsize, self.in_channels, x.size(-3), x.size(-2), x.size(-1)//2 + 1, 2, device=x.device)
-        out_ft[:, :, :self.modes1, :self.modes2, :self.modes3] = \
-            compl_mul3d(x_ft[:, :, :self.modes1, :self.modes2, :self.modes3], self.weights1)
-        out_ft[:, :, -self.modes1:, :self.modes2, :self.modes3] = \
-            compl_mul3d(x_ft[:, :, -self.modes1:, :self.modes2, :self.modes3], self.weights2)
-        out_ft[:, :, :self.modes1, -self.modes2:, :self.modes3] = \
-            compl_mul3d(x_ft[:, :, :self.modes1, -self.modes2:, :self.modes3], self.weights3)
-        out_ft[:, :, -self.modes1:, -self.modes2:, :self.modes3] = \
-            compl_mul3d(x_ft[:, :, -self.modes1:, -self.modes2:, :self.modes3], self.weights4)
+        midX, midY =  x.size(-3)//2, x.size(-2)//2 
+        x_ft = fftshift(x_ft) 
+
+        out_ft[:, :, midX-self.modes1:midX+self.modes1, midY-self.modes2:midY+self.modes2, :self.modes3] = \
+            compl_mul3d(x_ft[:, :, midX-self.modes1:midX+self.modes1, midY-self.modes2:midY+self.modes2, :self.modes3], self.weights)
+
+        x_ft, out_ft = fftshift(x_ft), fftshift(out_ft)
 
         #Return to physical space
         x = torch.irfft(out_ft, 3, normalized=True, onesided=True, signal_sizes=(x.size(-3), x.size(-2), x.size(-1)))
