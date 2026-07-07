@@ -62,9 +62,6 @@ class TensorGRaDProjector:
     def project(self, full_rank_grad, iter):
         if self.proj_tensor is None or iter % self.update_proj_gap == 0:
             self.proj_tensor = self.get_projection_tensor(full_rank_grad, self.rank)
-        self.proj_tensor = [
-            factor.to(full_rank_grad.device) for factor in self.proj_tensor
-        ]
         return self.transform(self.proj_tensor, full_rank_grad)
 
     def project_back(self, low_rank_grad):
