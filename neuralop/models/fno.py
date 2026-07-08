@@ -1,5 +1,5 @@
 from functools import partialmethod
-from typing import Tuple, List, Union, Literal
+from typing import Tuple, List, Optional, Union, Literal
 
 Number = Union[float, int]
 
@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings("once", category=UserWarning)
 
 
-from ..layers.embeddings import GridEmbeddingND, GridEmbedding2D
+from ..layers.embeddings import GridEmbeddingND, GridEmbedding2D, ConditioningEmbedding
 from ..layers.spectral_convolution import SpectralConv
 from ..layers.padding import DomainPadding
 from ..layers.fno_block import FNOBlocks
@@ -202,11 +202,43 @@ class FNO(BaseModel, name="FNO"):
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
+        conditioning_embedding: Optional[nn.Module] = None,
+        mode_modulation: Optional[dict] = None,
+        norm_modulation: Optional[dict] = None,
     ):
         if decomposition_kwargs is None:
             decomposition_kwargs = {}
         super().__init__()
         self.n_dim = len(n_modes)
+
+        # Optional conditioning. Time/parameter conditioning is active iff a
+        # ConditioningEmbedding is supplied AND at least one modulation dict is
+        # enabled. The embedding is computed once here in forward and threaded
+        # down; the layers only consume precomputed tensors.
+        self.conditioning_embedding = conditioning_embedding
+        self.n_params = (
+            conditioning_embedding.n_params if conditioning_embedding is not None else 1
+        )
+        cond_embed_dim = (
+            conditioning_embedding.out_dim if conditioning_embedding is not None else None
+        )
+        self._mode_mod_enabled = (
+            mode_modulation is not None and mode_modulation.get("enabled", True)
+        )
+        self._norm_mod_enabled = (
+            norm_modulation is not None and norm_modulation.get("enabled", True)
+        )
+        self._time_conditioned = self._mode_mod_enabled or self._norm_mod_enabled
+        if self._time_conditioned and conditioning_embedding is None:
+            raise ValueError(
+                "mode_modulation/norm_modulation is enabled but "
+                "`conditioning_embedding` is None; pass a ConditioningEmbedding."
+            )
+        if preactivation and self._norm_mod_enabled:
+            raise ValueError(
+                "norm_modulation is only supported with preactivation=False; "
+                "got preactivation=True."
+            )
 
         # n_modes is a special property - see the class' property for underlying mechanism
         # When updated, change should be reflected in fno blocks
@@ -308,6 +340,15 @@ class FNO(BaseModel, name="FNO"):
             conv_module=conv_module,
             n_layers=n_layers,
             enforce_hermitian_symmetry=enforce_hermitian_symmetry,
+            mode_modulation=mode_modulation if self._mode_mod_enabled else None,
+            cond_embed_dim=cond_embed_dim,
+        )
+
+        # FiLM (norm-modulation) heads live here, not in the block: their width
+        # depends on the block's channel count, so building them in the FNO
+        # keeps FNOBlocks as a pure applies-affine consumer of `mod_params`.
+        self._build_norm_modulator(
+            norm_modulation, cond_embed_dim, n_layers, hidden_channels
         )
 
         ## Lifting layer
@@ -338,7 +379,104 @@ class FNO(BaseModel, name="FNO"):
         if self.complex_data:
             self.projection = ComplexValued(self.projection)
 
-    def forward(self, x, output_shape=None, **kwargs):
+    def _build_norm_modulator(
+        self, norm_modulation, cond_embed_dim, n_layers, out_channels
+    ):
+        """Build the per-layer FiLM heads that map the embedding `e` to the
+        scale/shift/gate params applied around each block's norm layers.
+
+        Each head is a ChannelMLP (cond_embed_dim -> total_out_dim).
+        Disabled specs are omitted from the output, so the head is sized to
+        exactly the enabled params.
+        """
+        self.norm_modulator = None
+        self._mod_slices = {}
+        if not self._norm_mod_enabled:
+            return
+
+        modulate1 = bool(norm_modulation.get("modulate1", True))
+        modulate1_gate = bool(norm_modulation.get("modulate1_gate", True))
+        modulate2 = bool(norm_modulation.get("modulate2", True))
+        modulate2_gate = bool(norm_modulation.get("modulate2_gate", True))
+        hidden_channels = int(norm_modulation.get("hidden_channels", 64))
+
+        # Spec for the head output: name, channel count, enabled flag.
+        specs = [
+            ("scale1", out_channels, modulate1),
+            ("shift1", out_channels, modulate1),
+            ("gate1", 1, modulate1_gate),
+            ("scale2", out_channels, modulate2),
+            ("shift2", out_channels, modulate2),
+            ("gate2", 1, modulate2_gate),
+        ]
+        offset = 0
+        for name, dim, enabled in specs:
+            if enabled:
+                self._mod_slices[name] = slice(offset, offset + dim)
+                offset += dim
+
+        total_out_dim = offset
+        if total_out_dim == 0:
+            return
+
+        self.norm_modulator = nn.ModuleList(
+            [
+                ChannelMLP(
+                    in_channels=cond_embed_dim,
+                    out_channels=total_out_dim,
+                    hidden_channels=hidden_channels,
+                    n_dim=1,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+    def _film_params(self, e, layer_idx):
+        """Return the FiLM `mod_params` dict for a layer from embedding `e`.
+
+        Each value is shaped (B, dim, 1, ...) with self.n_dim trailing
+        singleton dims so it broadcasts over spatial axes. Disabled specs are
+        absent from the returned dict.
+        """
+        if self.norm_modulator is None:
+            return None
+        raw = self.norm_modulator[layer_idx](e.unsqueeze(-1))  # (B, total_out, 1)
+        spatial = (1,) * self.n_dim
+        params = {}
+        for name, sl in self._mod_slices.items():
+            v = raw[:, sl]
+            params[name] = v.reshape(v.shape[0], v.shape[1], *spatial)
+        return params
+
+    def _prepare_conditioning(self, x, t):
+        """Validate/normalize `t` to shape (B, n_params) and embed it.
+
+        Returns the embedding e of shape (B, out_dim), or None when
+        the model is not time-conditioned.
+        """
+        if not self._time_conditioned:
+            return None
+        if t is None:
+            t = torch.ones(
+                x.shape[0], self.n_params, dtype=x.dtype, device=x.device
+            )
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, dtype=x.dtype, device=x.device)
+        if t.ndim == 0:
+            t = t.expand(x.shape[0], 1)
+        elif t.ndim == 1:
+            if t.shape[0] == self.n_params:
+                t = t.unsqueeze(0).expand(x.shape[0], self.n_params)
+            elif t.shape[0] == x.shape[0]:
+                t = t.unsqueeze(-1)
+        if t.ndim != 2 or t.shape[1] != self.n_params or t.shape[0] != x.shape[0]:
+            raise ValueError(
+                f"t must have shape ({x.shape[0]}, {self.n_params}); got tensor "
+                f"with shape {tuple(t.shape)} for x batch {x.shape[0]}."
+            )
+        return self.conditioning_embedding(t)
+
+    def forward(self, x, output_shape=None, t=None, **kwargs):
         """FNO's forward pass
 
         1. Applies optional positional encoding
@@ -366,6 +504,13 @@ class FNO(BaseModel, name="FNO"):
             * If tuple, specifies the output-shape of the **last** FNO Block
 
             * If tuple list, specifies the exact output-shape of each FNO Block
+
+        t : float, int, or torch.Tensor, optional
+            Conditioning parameter(s), used only when the model was built with
+            a conditioning_embedding and a modulation dict. Accepted as a
+            Python scalar, a 0-d tensor, a 1-d tensor ((B,) or
+            (n_params,)), or a (B, n_params) tensor. Ignored when the
+            model is not conditioned; defaults to ones when omitted.
         """
         if kwargs:
             warnings.warn(
@@ -380,6 +525,9 @@ class FNO(BaseModel, name="FNO"):
         elif isinstance(output_shape, tuple):
             output_shape = [None] * (self.n_layers - 1) + [output_shape]
 
+        # Compute the conditioning embedding once; threaded to every block.
+        e = self._prepare_conditioning(x, t)
+
         # append spatial pos embedding if set
         if self.positional_embedding is not None:
             x = self.positional_embedding(x)
@@ -390,7 +538,11 @@ class FNO(BaseModel, name="FNO"):
             x = self.domain_padding.pad(x)
 
         for layer_idx in range(self.n_layers):
-            x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+            mod_params = self._film_params(e, layer_idx) if e is not None else None
+            x = self.fno_blocks(
+                x, layer_idx, output_shape=output_shape[layer_idx],
+                mode_embedding=e, mod_params=mod_params,
+            )
 
         if self.domain_padding is not None:
             x = self.domain_padding.unpad(x)
@@ -407,6 +559,17 @@ class FNO(BaseModel, name="FNO"):
     def n_modes(self, n_modes):
         self.fno_blocks.n_modes = n_modes
         self._n_modes = n_modes
+
+    def clear_all_caches(self):
+        """Clear cached frequency-mode grids in all spectral conv submodules.
+
+        Spectral convs cache the phi_k grid per (shape, device) when mode
+        modulation is enabled. Call this after changing input resolution or
+        moving the model to a new device so the grids are rebuilt.
+        """
+        for module in self.modules():
+            if hasattr(module, "clear_cache"):
+                module.clear_cache()
 
 
 def partialclass(new_name, cls, *args, **kwargs):
@@ -469,6 +632,76 @@ class TFNO(FNO):
     >>> # Equivalent FNO model with explicit factorization:
     >>> model = FNO(n_modes=(12, 12), in_channels=1, out_channels=1, hidden_channels=64,
     ...             factorization="Tucker", rank=0.1)
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("factorization", "Tucker")
+        kwargs.setdefault("rank", 0.1)
+        super().__init__(*args, **kwargs)
+
+
+# Default mode-modulation config used by the time-conditioned convenience
+# classes. Magnitude-preserving polar modulation, ~identity at init.
+_T_EMB_DEFAULT_MODE_MOD = {
+    "enabled": True,
+    "type": "polar",
+    "hidden_channels": 64,
+    "k_embed_dim": 32,
+    "type_k": "power",
+}
+
+
+class t_emb_FNO(FNO):
+    """Time/parameter-conditioned Fourier Neural Operator.
+
+    An :class:`FNO` pre-wired for conditioning: it builds a default
+    :class:`~neuralop.layers.embeddings.ConditioningEmbedding` and enables
+    polar mode modulation, so forward(x, t=...) conditions out of the box.
+    Supports vector-valued conditioning via n_params: pass t of shape
+    (B, n_params).
+
+    Parameters
+    ----------
+    n_params : int, optional
+        Number of conditioning parameters. Default 1 (scalar conditioning).
+    embed_dim : int, optional
+        Per-parameter embedding width. Default 32.
+    type_t : {'sinusoidal', 'power'}, optional
+        Conditioning feature map. Default 'sinusoidal' (valid for any real
+        t; 'power' requires t > 0).
+
+    Any of conditioning_embedding, mode_modulation, or
+    norm_modulation passed explicitly override the defaults.
+
+    Examples
+    --------
+    >>> from neuralop.models import t_emb_FNO
+    >>> import torch
+    >>> # scalar conditioning
+    >>> model = t_emb_FNO(n_modes=(12, 12), in_channels=1, out_channels=1,
+    ...                   hidden_channels=64)
+    >>> y = model(torch.randn(2, 1, 16, 16), t=0.5)
+    >>> # vector conditioning: t of shape (B, 5)
+    >>> model = t_emb_FNO(n_modes=(12, 12), in_channels=1, out_channels=1,
+    ...                   hidden_channels=64, n_params=5)
+    >>> y = model(torch.randn(8, 1, 16, 16), t=torch.rand(8, 5))
+    """
+
+    def __init__(self, *args, n_params: int = 1, embed_dim: int = 32,
+                 type_t: str = "sinusoidal", **kwargs):
+        kwargs.setdefault("mode_modulation", _T_EMB_DEFAULT_MODE_MOD.copy())
+        if kwargs.get("conditioning_embedding") is None:
+            kwargs["conditioning_embedding"] = ConditioningEmbedding(
+                embed_dim=embed_dim, n_params=n_params, type_t=type_t
+            )
+        super().__init__(*args, **kwargs)
+
+
+class t_emb_TFNO(t_emb_FNO):
+    """Time-conditioned Tucker-factorized FNO.
+
+    Combines :class:`t_emb_FNO` with :class:`TFNO`'s defaults
+    (factorization='Tucker', rank=0.1).
     """
 
     def __init__(self, *args, **kwargs):

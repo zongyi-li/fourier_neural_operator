@@ -284,3 +284,253 @@ def test_fno_channel_mlp_params(channel_mlp_dropout, channel_mlp_expansion, non_
 
     # Check output size
     assert list(out.shape) == [batch_size, 1, *size]
+
+
+# ----------------------------------------------------------------------
+# Time / parameter-conditioned FNO
+#
+# The embedding is computed once by FNO (via a ConditioningEmbedding) and
+# threaded to the layers. These tests cover scalar and vector conditioning,
+# both modulation paths, the t>0 power guard, and the "no change when
+# unconditioned" invariant.
+# ----------------------------------------------------------------------
+
+from neuralop.models import t_emb_FNO, t_emb_TFNO
+from neuralop.layers.embeddings import ConditioningEmbedding
+
+
+def _cond_embed(embed_dim=8, n_params=1, type_t="sinusoidal"):
+    return ConditioningEmbedding(
+        embed_dim=embed_dim, n_params=n_params, type_t=type_t
+    )
+
+
+def _mode_mod(mod_type="real"):
+    return {
+        "enabled": True, "type": mod_type, "hidden_channels": 16,
+        "k_embed_dim": 8, "type_k": "power",
+    }
+
+
+def _norm_mod():
+    return {
+        "enabled": True, "hidden_channels": 16,
+        "modulate1": True, "modulate1_gate": True,
+        "modulate2": True, "modulate2_gate": True,
+    }
+
+
+def test_fno_default_is_not_conditioned():
+    """A default FNO is not time-conditioned and ignores t."""
+    model = FNO(
+        in_channels=2, out_channels=2, n_modes=(6, 6),
+        hidden_channels=8, n_layers=2,
+    )
+    assert model._time_conditioned is False
+    assert model.norm_modulator is None
+    x = torch.randn(2, 2, 12, 12)
+    with torch.no_grad():
+        torch.testing.assert_close(model(x), model(x, t=0.5))
+
+
+def test_fno_modulation_without_embedding_raises():
+    with pytest.raises(ValueError, match="conditioning_embedding"):
+        FNO(
+            in_channels=2, out_channels=1, n_modes=(6, 6),
+            hidden_channels=8, n_layers=1,
+            mode_modulation=_mode_mod("real"),
+        )
+
+
+def test_fno_preactivation_with_norm_modulation_raises():
+    with pytest.raises(ValueError, match="preactivation"):
+        FNO(
+            in_channels=2, out_channels=1, n_modes=(6, 6),
+            hidden_channels=8, n_layers=1, preactivation=True,
+            conditioning_embedding=_cond_embed(),
+            norm_modulation=_norm_mod(),
+        )
+
+
+@pytest.mark.parametrize("n_dim", [1, 2, 3])
+@pytest.mark.parametrize("factorization", [None, "Tucker"])
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_fno_time_conditioned_forward_backward(n_dim, factorization, mod_type):
+    torch.manual_seed(0)
+    n_modes = (6,) * n_dim
+    spatial = (10,) * n_dim
+    rank = 0.4 if factorization == "Tucker" else 1.0
+
+    model = FNO(
+        in_channels=2, out_channels=1, n_modes=n_modes,
+        hidden_channels=8, n_layers=2, factorization=factorization, rank=rank,
+        conditioning_embedding=_cond_embed(),
+        mode_modulation=_mode_mod(mod_type),
+        norm_modulation=_norm_mod(),
+    )
+    assert model._time_conditioned is True
+
+    x = torch.randn(2, 2, *spatial, requires_grad=True)
+    t = torch.tensor([[0.5], [1.5]])
+    out = model(x, t=t)
+    assert list(out.shape) == [2, 1, *spatial]
+    assert torch.isfinite(out).all()
+
+    out.sum().backward()
+    assert x.grad is not None
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"no grad for {name}"
+
+
+@pytest.mark.parametrize(
+    "t_factory",
+    [
+        lambda B: 0.5,
+        lambda B: torch.tensor(0.5),
+        lambda B: torch.full((B,), 0.5),
+        lambda B: torch.full((B, 1), 0.5),
+    ],
+)
+def test_fno_t_broadcast(t_factory):
+    torch.manual_seed(0)
+    model = FNO(
+        in_channels=2, out_channels=1, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+        conditioning_embedding=_cond_embed(),
+        mode_modulation=_mode_mod("real"),
+    )
+    B = 2
+    x = torch.randn(B, 2, 12, 12)
+    out = model(x, t=t_factory(B))
+    assert list(out.shape) == [B, 1, 12, 12]
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_fno_vector_valued_conditioning(mod_type):
+    """n_params > 1: t of shape (B, P) runs forward and backward."""
+    torch.manual_seed(0)
+    P = 5
+    model = FNO(
+        in_channels=2, out_channels=2, n_modes=(6, 6),
+        hidden_channels=8, n_layers=2,
+        conditioning_embedding=_cond_embed(n_params=P),
+        mode_modulation=_mode_mod(mod_type),
+        norm_modulation=_norm_mod(),
+    )
+    assert model._time_conditioned is True
+
+    B = 4
+    x = torch.randn(B, 2, 12, 12, requires_grad=True)
+    t = torch.rand(B, P)
+    out = model(x, t=t)
+    assert list(out.shape) == [B, 2, 12, 12]
+    assert torch.isfinite(out).all()
+
+    out.sum().backward()
+    assert x.grad is not None
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"no grad for {name}"
+
+
+@pytest.mark.parametrize("modulation", ["mode", "norm"])
+def test_fno_sinusoidal_conditioning_accepts_nonpositive_t(modulation):
+    """Sinusoidal embedding must accept t <= 0 on both modulation paths.
+
+    Regression test: sin/cos are well-defined for any real t, so the t > 0
+    guard belongs only to the 'power' embedding. Signed conditioning params
+    are the whole point of vector-valued conditioning.
+    """
+    torch.manual_seed(0)
+    kwargs = dict(
+        in_channels=2, out_channels=2, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+        conditioning_embedding=_cond_embed(n_params=3, type_t="sinusoidal"),
+    )
+    if modulation == "mode":
+        kwargs["mode_modulation"] = _mode_mod("real")
+    else:
+        kwargs["norm_modulation"] = _norm_mod()
+    model = FNO(**kwargs)
+
+    x = torch.randn(2, 2, 12, 12)
+    t = torch.tensor([[-1.0, 0.0, 2.0], [-0.5, -3.0, 1.0]])  # negatives and zero
+    out = model(x, t=t)
+    assert list(out.shape) == [2, 2, 12, 12]
+    assert torch.isfinite(out).all()
+
+
+def test_fno_power_conditioning_rejects_nonpositive_t():
+    """The power embedding must still reject t <= 0 (per-parameter)."""
+    torch.manual_seed(0)
+    model = FNO(
+        in_channels=2, out_channels=1, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+        conditioning_embedding=_cond_embed(n_params=2, type_t="power"),
+        mode_modulation=_mode_mod("real"),
+    )
+    x = torch.randn(2, 2, 12, 12)
+    with pytest.raises(ValueError, match=r"requires t > 0"):
+        model(x, t=torch.tensor([[1.0, -1.0], [2.0, 3.0]]))
+
+
+def test_fno_vector_conditioning_rejects_wrong_param_count():
+    """A (B, P) t whose P != n_params raises a clear shape error."""
+    torch.manual_seed(0)
+    model = FNO(
+        in_channels=2, out_channels=1, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+        conditioning_embedding=_cond_embed(n_params=4),
+        mode_modulation=_mode_mod("real"),
+    )
+    x = torch.randn(2, 2, 12, 12)
+    with pytest.raises(ValueError, match=r"shape \(2, 4\)"):
+        model(x, t=torch.rand(2, 3))
+
+
+def test_fno_time_conditioned_t_defaults_to_one():
+    """A time-conditioned FNO with t omitted defaults to t=1 and runs."""
+    torch.manual_seed(0)
+    model = FNO(
+        in_channels=2, out_channels=1, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+        conditioning_embedding=_cond_embed(),
+        mode_modulation=_mode_mod("real"),
+    )
+    x = torch.randn(2, 2, 12, 12)
+    out = model(x)
+    assert list(out.shape) == [2, 1, 12, 12]
+
+
+def test_t_emb_fno_is_conditioned_out_of_the_box():
+    """t_emb_FNO wires a default embedding + polar mode modulation."""
+    model = t_emb_FNO(
+        in_channels=2, out_channels=1, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+    )
+    assert isinstance(model, FNO)
+    assert model._time_conditioned is True
+    out = model(torch.randn(2, 2, 12, 12), t=0.5)
+    assert list(out.shape) == [2, 1, 12, 12]
+
+
+def test_t_emb_fno_vector_conditioning():
+    """t_emb_FNO(n_params=P) accepts t of shape (B, P)."""
+    torch.manual_seed(0)
+    model = t_emb_FNO(
+        in_channels=1, out_channels=1, n_modes=(8, 8),
+        hidden_channels=8, n_layers=2, n_params=5,
+    )
+    x = torch.randn(3, 1, 16, 16)
+    out = model(x, t=torch.rand(3, 5))
+    assert list(out.shape) == [3, 1, 16, 16]
+
+
+def test_t_emb_tfno_sets_tucker_and_conditioned():
+    model = t_emb_TFNO(
+        in_channels=2, out_channels=1, n_modes=(6, 6),
+        hidden_channels=8, n_layers=1,
+    )
+    assert isinstance(model, t_emb_FNO)
+    assert isinstance(model, FNO)
+    assert model._time_conditioned is True
+    assert model.factorization == "Tucker"
