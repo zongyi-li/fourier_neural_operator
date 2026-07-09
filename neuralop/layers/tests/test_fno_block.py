@@ -223,3 +223,117 @@ def test_FNOBlock_skip_connections_preactivation(fno_skip, channel_mlp_skip):
 
     # Check output shape
     assert res.shape == (2, 4, *size)
+
+
+# ----------------------------------------------------------------------
+# Optional conditioning pathway. The block threads a precomputed `mode_embedding` to its spectral conv and applies precomputed
+# FiLM params (`mod_params`) around its norm sites. Both are computed upstream
+# by the FNO. These tests exercise the block in isolation.
+
+
+def _mode_mod(mod_type="real", k_embed_dim=8, type_k="power"):
+    return {
+        "enabled": True,
+        "type": mod_type,
+        "hidden_channels": 16,
+        "k_embed_dim": k_embed_dim,
+        "type_k": type_k,
+    }
+
+
+@pytest.mark.parametrize("norm", [None, "group_norm", "instance_norm"])
+def test_block_default_ignores_mode_embedding(norm):
+    """A block built without mode_modulation ignores mode_embedding."""
+    torch.manual_seed(0)
+    block = FNOBlocks(2, 2, (6, 6), n_layers=2, norm=norm)
+    assert not block._mode_mod_enabled
+    x = torch.randn(2, 2, 10, 10)
+    y_plain = block(x, index=0)
+    y_emb = block(x, index=0, mode_embedding=torch.randn(2, 8))
+    torch.testing.assert_close(y_plain, y_emb)
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_mode_modulation_forward(mod_type):
+    torch.manual_seed(0)
+    cond_embed_dim = 10
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=2, norm="group_norm",
+        mode_modulation=_mode_mod(mod_type), cond_embed_dim=cond_embed_dim,
+    )
+    x = torch.randn(2, 2, 10, 10)
+    e = torch.randn(2, cond_embed_dim)
+    y = block(x, index=0, mode_embedding=e)
+    assert y.shape == (2, 2, 10, 10)
+    assert torch.isfinite(y).all()
+
+
+def test_block_mode_modulation_requires_embedding():
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=2,
+        mode_modulation=_mode_mod("real"), cond_embed_dim=8,
+    )
+    with pytest.raises(ValueError, match="mode_embedding"):
+        block(torch.randn(2, 2, 10, 10), index=0)
+
+
+def test_block_film_none_and_zero_are_identity():
+    """No mod_params, empty dict, and zero scale/shift all leave output
+    unchanged (x*(1+0)+0 == x, and no gate keys => no gating)."""
+    torch.manual_seed(0)
+    block = FNOBlocks(2, 2, (6, 6), n_layers=1, norm="group_norm")
+    x = torch.randn(2, 2, 10, 10)
+    y_none = block(x, index=0)
+    y_empty = block(x, index=0, mod_params={})
+    zero = {
+        "scale1": torch.zeros(2, 2, 1, 1), "shift1": torch.zeros(2, 2, 1, 1),
+        "scale2": torch.zeros(2, 2, 1, 1), "shift2": torch.zeros(2, 2, 1, 1),
+    }
+    y_zero = block(x, index=0, mod_params=zero)
+    torch.testing.assert_close(y_none, y_empty)
+    torch.testing.assert_close(y_none, y_zero)
+
+
+def test_block_film_changes_output_and_backprops():
+    """Non-trivial FiLM params change the output and are differentiable."""
+    torch.manual_seed(0)
+    block = FNOBlocks(2, 2, (6, 6), n_layers=1, norm="group_norm")
+    x = torch.randn(2, 2, 10, 10)
+    y_ref = block(x, index=0)
+
+    mp = {
+        "scale1": torch.randn(2, 2, 1, 1, requires_grad=True),
+        "shift1": torch.randn(2, 2, 1, 1, requires_grad=True),
+        "gate1": torch.randn(2, 1, 1, 1, requires_grad=True),
+        "scale2": torch.randn(2, 2, 1, 1, requires_grad=True),
+        "shift2": torch.randn(2, 2, 1, 1, requires_grad=True),
+        "gate2": torch.randn(2, 1, 1, 1, requires_grad=True),
+    }
+    y = block(x, index=0, mod_params=mp)
+    assert y.shape == (2, 2, 10, 10)
+    assert not torch.allclose(y, y_ref)
+    y.sum().backward()
+    for name, p in mp.items():
+        assert p.grad is not None, f"no grad for {name}"
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_mode_and_film_backward(mod_type):
+    """Both pathways together: grads reach x, conv params, and FiLM params."""
+    torch.manual_seed(0)
+    cond_embed_dim = 8
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=1, norm="group_norm",
+        mode_modulation=_mode_mod(mod_type), cond_embed_dim=cond_embed_dim,
+    )
+    x = torch.randn(2, 2, 10, 10, requires_grad=True)
+    e = torch.randn(2, cond_embed_dim)
+    mp = {
+        "scale1": torch.randn(2, 2, 1, 1), "shift1": torch.randn(2, 2, 1, 1),
+        "gate1": torch.randn(2, 1, 1, 1),
+    }
+    y = block(x, index=0, mode_embedding=e, mod_params=mp)
+    y.sum().backward()
+    assert x.grad is not None
+    for name, param in block.named_parameters():
+        assert param.grad is not None, f"no grad for {name}"
