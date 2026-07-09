@@ -91,6 +91,10 @@ class FNO(BaseModel, name="FNO"):
     fno_skip : Literal["linear", "identity", "soft-gating", None], optional
         Type of skip connection to use in FNO layers. Options: "linear", "identity", "soft-gating", None.
         Default: "linear"
+    conv_bias_kernel : int, optional
+        Kernel size for the local convolutional bias term used when ``fno_skip="linear"``.
+        ``1`` preserves the default pointwise bias term, while larger kernels add a
+        local convolution alongside the global spectral convolution. Default: 1
     resolution_scaling_factor : Union[Number, List[Number]], optional
         Layer-wise factor by which to scale the domain resolution of function.
         Options:
@@ -188,6 +192,7 @@ class FNO(BaseModel, name="FNO"):
         channel_mlp_expansion: float = 0.5,
         channel_mlp_skip: Literal["linear", "identity", "soft-gating", None] = "soft-gating",
         fno_skip: Literal["linear", "identity", "soft-gating", None] = "linear",
+        conv_bias_kernel: int = 1,
         resolution_scaling_factor: Union[Number, List[Number]] = None,
         domain_padding: Union[Number, List[Number]] = None,
         fno_block_precision: str = "full",
@@ -230,6 +235,7 @@ class FNO(BaseModel, name="FNO"):
         self.fixed_rank_modes = fixed_rank_modes
         self.decomposition_kwargs = decomposition_kwargs
         self.fno_skip = (fno_skip,)
+        self.conv_bias_kernel = conv_bias_kernel
         self.channel_mlp_skip = (channel_mlp_skip,)
         self.implementation = implementation
         self.separable = separable
@@ -295,6 +301,7 @@ class FNO(BaseModel, name="FNO"):
             norm_groups=norm_groups,
             preactivation=preactivation,
             fno_skip=fno_skip,
+            conv_bias_kernel=conv_bias_kernel,
             channel_mlp_skip=channel_mlp_skip,
             complex_data=complex_data,
             max_n_modes=max_n_modes,

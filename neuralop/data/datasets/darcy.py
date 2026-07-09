@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from typing import Union, List
 
+import torch
 from torch.utils.data import DataLoader
 
 from .pt_dataset import PTDataset
@@ -50,6 +51,11 @@ class DarcyDataset(PTDataset):
         dimension of saved tensors to index data channels, by default 1
     subsampling_rate : int or List[int], optional
         rate at which to subsample each input dimension, by default None
+    dtype : torch.dtype, optional
+        dtype to cast input tensors to after loading. The bundled Darcy
+        coefficient fields are stored as torch.bool, so this defaults to
+        torch.float32 to keep them usable by float models. Pass None to
+        preserve the saved dtype. Default is torch.float32.
     download : bool, optional
         whether to download data if not present, by default True
 
@@ -75,6 +81,7 @@ class DarcyDataset(PTDataset):
         encoding="channel-wise",
         channel_dim=1,
         subsampling_rate=None,
+        dtype: torch.dtype = torch.float32,
         download: bool = True,
     ):
         """Initialize the DarcyDataset.
@@ -133,6 +140,7 @@ class DarcyDataset(PTDataset):
             channel_dim=channel_dim,
             input_subsampling_rate=subsampling_rate,
             output_subsampling_rate=subsampling_rate,
+            dtype=dtype,
         )
 
 

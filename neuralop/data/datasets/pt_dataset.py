@@ -53,6 +53,11 @@ class PTDataset:
         rate at which to subsample each output dimension, by default None
     channel_dim : int, optional
         dimension of saved tensors to index data channels, by default 1
+    dtype : torch.dtype, optional
+        dtype to cast input tensors to after loading. If None, the original
+        dtype of the saved data is preserved (e.g. torch.complex64 stays
+        complex). Pass torch.float32 to restore the previous default behaviour.
+        Default is None.
     channels_squeezed : bool, optional
         If the channels dim is 1, whether that is explicitly kept in the saved tensor.
         If not, we need to unsqueeze it to explicitly have a channel dim.
@@ -83,6 +88,7 @@ class PTDataset:
         input_subsampling_rate=None,
         output_subsampling_rate=None,
         channel_dim=1,
+        dtype=None,
         channels_squeezed=True,
     ):
         """Initialize the PTDataset.
@@ -106,7 +112,7 @@ class PTDataset:
         Path(root_dir).joinpath(f"{dataset_name}_train_{train_resolution}.pt").as_posix()
         )
 
-        x_train = data["x"].type(torch.float32).clone()
+        x_train = data["x"].to(dtype).clone()
         if channels_squeezed:
             x_train = x_train.unsqueeze(channel_dim)
 
@@ -203,7 +209,7 @@ class PTDataset:
             print(f"Loading test db for resolution {res} with {n_test} samples ")
             data = torch.load(Path(root_dir).joinpath(f"{dataset_name}_test_{res}.pt").as_posix())
 
-            x_test = data["x"].type(torch.float32).clone()
+            x_test = data["x"].to(dtype).clone()
             if channels_squeezed:
                 x_test = x_test.unsqueeze(channel_dim)
             # optionally subsample along data indices
