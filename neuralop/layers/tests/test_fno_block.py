@@ -337,3 +337,27 @@ def test_block_mode_and_film_backward(mod_type):
     assert x.grad is not None
     for name, param in block.named_parameters():
         assert param.grad is not None, f"no grad for {name}"
+        
+@pytest.mark.parametrize("n_dim", [1, 2, 3])
+def test_FNOBlock_conv_bias_kernel(n_dim):
+    """Test local convolutional bias kernels beside spectral convolution."""
+    modes = (8, 8, 8)
+    size = [10, 10, 10]
+    conv_bias_kernel = 3
+
+    block = FNOBlocks(
+        3,
+        4,
+        modes[:n_dim],
+        n_layers=2,
+        conv_bias_kernel=conv_bias_kernel,
+        fno_skip="linear",
+        use_channel_mlp=False,
+    )
+
+    x = torch.randn(2, 3, *size[:n_dim])
+    res = block(x)
+
+    assert res.shape == (2, 4, *size[:n_dim])
+    assert block.conv_bias_kernel == conv_bias_kernel
+    assert block.fno_skips[0].kernel_size == (conv_bias_kernel,) * n_dim

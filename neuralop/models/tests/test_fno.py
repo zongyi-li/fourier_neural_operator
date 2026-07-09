@@ -534,3 +534,34 @@ def test_t_emb_tfno_sets_tucker_and_conditioned():
     assert isinstance(model, FNO)
     assert model._time_conditioned is True
     assert model.factorization == "Tucker"
+    
+def test_fno_conv_bias_kernel():
+    """Test FNO with a local convolutional bias kernel."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
+    modes = 5
+    hidden_channels = 9
+    batch_size = 3
+    n_layers = 2
+    n_dim = 2
+    size = (s,) * n_dim
+    n_modes = (modes,) * n_dim
+    conv_bias_kernel = 3
+
+    model = FNO(
+        in_channels=3,
+        out_channels=1,
+        n_modes=n_modes,
+        hidden_channels=hidden_channels,
+        n_layers=n_layers,
+        conv_bias_kernel=conv_bias_kernel,
+    ).to(device)
+
+    in_data = torch.randn(batch_size, 3, *size).to(device)
+    out = model(in_data)
+
+    assert list(out.shape) == [batch_size, 1, *size]
+    assert model.conv_bias_kernel == conv_bias_kernel
+    assert model.fno_blocks.conv_bias_kernel == conv_bias_kernel
+
+    out.sum().backward()
