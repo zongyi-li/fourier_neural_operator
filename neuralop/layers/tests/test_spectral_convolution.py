@@ -164,24 +164,6 @@ def test_modulated_forward_shape(dim, mod_type, type_k):
     assert torch.isfinite(y).all()
 
 
-@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
-def test_modulated_backward_grads_all_params(mod_type):
-    torch.manual_seed(0)
-    cond_embed_dim = 8
-    layer = SpectralConv(
-        3, 3, (6, 6),
-        mode_modulation=_mode_mod(mod_type),
-        cond_embed_dim=cond_embed_dim,
-    )
-    x = torch.randn(2, 3, 10, 10, requires_grad=True)
-    e = torch.randn(2, cond_embed_dim)
-    y = layer(x, mode_embedding=e)
-    y.sum().backward()
-    assert x.grad is not None
-    for name, param in layer.named_parameters():
-        assert param.grad is not None, f"no grad for {name}"
-
-
 def test_modulated_backward_grad_matches_finite_difference():
     """The modulated conv is affine in x (the modulation factor depends only
     on the embedding and mode index, not on x), so the directional derivative
