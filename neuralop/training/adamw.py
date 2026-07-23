@@ -5,13 +5,14 @@ from typing import Callable, Iterable, Tuple, Union
 import torch
 from torch import nn
 from torch.optim import Optimizer
-from .tensor_galore_projector import TensorGaLoreProjector
+from .tensorgrad import TensorGRaDProjector
 
 
 class AdamW(Optimizer):
     """
     Implements AdamW (Adam with weight decay fix [1]_), and offers
-    optional Tensor-GaLore projection (see [2]_ and [3]_) for memory-efficient training.
+    optional GaLore projection (see [2]_) using the TensorGRaD tensor
+    projector (see [3]_) for memory-efficient training.
 
     Parameters
     ----------
@@ -34,11 +35,12 @@ class AdamW(Optimizer):
         Either a float corresponding to a percentage of params
         to preserve, or an list of int ranks corresponding to
         each mode of the tensor. If a single int is given, it is used
-        for all modes (see `neuralop/training/tensor_galore_projector.py`)
+        for all modes (see `neuralop/training/tensorgrad.py`)
     galore_update_proj_gap : `int`, defaults to 50
         Number of optimizer steps before projection tensors are recomputed,
     galore_scale : `float`, defaults to 1.0
-        Additional lr-like scalar by which galore parameters are multiplied before update
+        Additional lr-like scalar by which compressed parameters are multiplied
+        before update
     activation_checkpoint: bool, default False
         whether to use activation checkpointing during projection
     no_deprecation_warning : `bool`, *optional*, defaults to `False`:
@@ -49,13 +51,16 @@ class AdamW(Optimizer):
     .. _[1] : Loschchilov, I. and Hutter, F. (2019). Decoupled Decay Regularization.
          ICLR 2019, https://arxiv.org/pdf/1711.05101.
 
-    .. _[2] : Zhao, J, Zhang, Z., Chen, B., Wang, Z., Anandkumar, A., Tian Y. (2024).
-        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection. ICML 2024,
-        https://arxiv.org/abs/2403.03507.
+    .. _[2] : Zhao, J., Zhang, Z., Chen, B., Wang, Z., Anandkumar, A.,
+        Tian, Y. (2024).
+        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection.
+        ICML 2024, https://arxiv.org/abs/2403.03507.
 
-    .. _[3] : George, R., Pitt, D., Zhao, J., Kossaifi, J., Luo, C., Tian, Y., Anandkumar, A (2024).
-        Tensor-GaLore: Memory-Efficient Training via Gradient Tensor Decomposition. arXiv preprint,
-        https://arxiv.org/pdf/2501.02379.
+    .. _[3] : Loeschcke, S., Pitt, D., George, R., Zhao, J., Luo, C.,
+        Tian, Y., Kossaifi, J., Anandkumar, A. (2025).
+        TensorGRaD: Tensor Gradient Robust Decomposition for Memory-Efficient
+        Neural Operator Training. arXiv preprint,
+        https://arxiv.org/abs/2501.02379.
     """
 
     def __init__(
@@ -90,7 +95,7 @@ class AdamW(Optimizer):
         }
         super().__init__(params, defaults)
 
-        # Keep optional GaLore parameters separate for projection
+        # Keep optional GaLore parameters separate for projection.
         if galore_params is not None:
             self.add_param_group(
                 {
@@ -135,10 +140,10 @@ class AdamW(Optimizer):
                 if "step" not in state:
                     state["step"] = 0
 
-                # GaLore Projection
+                # GaLore projection.
                 if group.get("galore", False):
                     if "projector" not in state:
-                        state["projector"] = TensorGaLoreProjector(
+                        state["projector"] = TensorGRaDProjector(
                             rank=self.galore_rank,
                             update_proj_gap=self.galore_update_proj_gap,
                             scale=self.galore_scale,
@@ -180,7 +185,7 @@ class AdamW(Optimizer):
                 # compute norm gradient
                 norm_grad = exp_avg / denom
 
-                # GaLore Projection Back
+                # GaLore projection back.
                 if group.get("galore", False):
                     norm_grad = state["projector"].project_back(norm_grad)
 
