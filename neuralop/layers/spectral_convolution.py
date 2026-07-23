@@ -370,19 +370,16 @@ class SpectralConv(BaseSpectralConv):
         self.n_modes = n_modes
 
         if max_n_modes is None:
-            self.true_max_n_modes = list(self.true_n_modes)
-            max_n_modes = self.n_modes
+            max_n_modes = list(self.true_n_modes)
         elif isinstance(max_n_modes, int):
-            self.true_max_n_modes = [max_n_modes]
-            max_n_modes = self._fft_storage_n_modes(max_n_modes)
+            max_n_modes = [max_n_modes]
         else:
-            self.true_max_n_modes = list(max_n_modes)
-            max_n_modes = self._fft_storage_n_modes(max_n_modes)
+            max_n_modes = list(max_n_modes)
         self.max_n_modes = max_n_modes
 
         self.fft_norm = fft_norm
         self.index_set = (
-            HyperRectangleIndexSet.from_n_modes_per_dim(self.true_max_n_modes)
+            HyperRectangleIndexSet.from_n_modes_per_dim(self.max_n_modes)
             if index_set is None
             else index_set
         )
@@ -433,7 +430,7 @@ class SpectralConv(BaseSpectralConv):
             factorization = "Dense"  # No factorization
 
         weight_shape = self.spectral_transform.weight_shape(
-            self.index_set, true_max_n_modes=self.true_max_n_modes
+            self.index_set, max_n_modes=self.max_n_modes
         )
         if separable:
             if in_channels != out_channels:
@@ -522,7 +519,7 @@ class SpectralConv(BaseSpectralConv):
         return tuple(shape)
 
     def _fft_storage_n_modes(self, n_modes):
-        """This is only here for the legacy fields n_modes and max_n_modes."""
+        """This is only here for the legacy fields n_modes."""
         n_modes = self._as_mode_list(n_modes)
         if not self.complex_data:
             n_modes[-1] = n_modes[-1] // 2 + 1
@@ -530,10 +527,10 @@ class SpectralConv(BaseSpectralConv):
 
     def _validate_index_set_radius(self):
         if isinstance(self.index_set, RadialIndexSet):
-            expected_radius = self.index_set.radius_from_n_modes(self.true_max_n_modes)
+            expected_radius = self.index_set.radius_from_n_modes(self.max_n_modes)
             if not isclose(self.index_set.radius, expected_radius):
                 raise ValueError(
-                    "Expected index_set.radius to agree with true_max_n_modes[0] "
+                    "Expected index_set.radius to agree with max_n_modes[0] "
                     f"(got radius={self.index_set.radius}, expected {expected_radius})."
                 )
 
@@ -576,7 +573,6 @@ class SpectralConv(BaseSpectralConv):
             fft_size=transform_state.fft_size,
             max_n_modes=self.max_n_modes,
             true_n_modes=self.true_n_modes,
-            true_max_n_modes=self.true_max_n_modes,
             separable=self.separable,
             device=x.device,
         )
