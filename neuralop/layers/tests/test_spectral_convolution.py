@@ -346,8 +346,8 @@ def test_SpectralConv_keeps_true_modes_for_real_fields():
 
     assert conv.true_n_modes == [6, 8]
     assert conv.n_modes == [6, 5]
-    assert conv.true_max_n_modes == [10, 12]
-    assert conv.max_n_modes == [10, 7]
+    assert conv.max_n_modes == [10, 12]
+    assert conv.practical_max_n_modes == [10, 7]
     assert conv.index_set.n_modes_per_dim == (10, 12)
 
 

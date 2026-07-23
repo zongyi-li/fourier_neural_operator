@@ -60,7 +60,7 @@ class SpectralTransform(ABC):
         pass
 
     @abstractmethod
-    def weight_shape(self, index_set, true_max_n_modes):
+    def weight_shape(self, index_set, max_n_modes):
         pass
 
     @abstractmethod
@@ -69,7 +69,7 @@ class SpectralTransform(ABC):
         fft_size,
         max_n_modes,
         true_n_modes,
-        true_max_n_modes,
+        practical_max_n_modes,
         separable=False,
         device=None,
     ):
@@ -165,9 +165,9 @@ class RegularGridFFT(SpectralTransform):
             output_shape=tuple(output_shape),
         )
 
-    def weight_shape(self, index_set, true_max_n_modes):
+    def weight_shape(self, index_set, max_n_modes):
         if isinstance(index_set, HyperRectangleIndexSet):
-            return tuple(self._fft_storage_n_modes(true_max_n_modes))
+            return tuple(self._fft_storage_n_modes(max_n_modes))
         return (index_set.n_modes,)
 
     def _fft_storage_n_modes(self, n_modes):
@@ -182,7 +182,7 @@ class RegularGridFFT(SpectralTransform):
         fft_size,
         max_n_modes,
         true_n_modes,
-        true_max_n_modes,
+        practical_max_n_modes,
         separable=False,
         device=None,
     ):
@@ -191,8 +191,8 @@ class RegularGridFFT(SpectralTransform):
             device,
             id(index_set),
             tuple(fft_size),
+            tuple(practical_max_n_modes),
             tuple(max_n_modes),
-            tuple(true_max_n_modes),
             active_radius,
             self.complex_data,
             separable,
@@ -207,7 +207,7 @@ class RegularGridFFT(SpectralTransform):
                 fft_size=fft_size,
                 max_n_modes=max_n_modes,
                 true_n_modes=true_n_modes,
-                true_max_n_modes=true_max_n_modes,
+                practical_max_n_modes=practical_max_n_modes,
                 separable=separable,
             )
         else:
@@ -257,19 +257,19 @@ class RegularGridFFT(SpectralTransform):
         fft_size,
         max_n_modes,
         true_n_modes,
-        true_max_n_modes,
+        practical_max_n_modes,
         separable=False,
     ):
-        max_n_modes = self._fft_storage_n_modes(true_max_n_modes)
+        practical_max_n_modes = self._fft_storage_n_modes(max_n_modes)
         n_modes_per_dim = index_set.n_modes_per_dim_for_radius(
             radius_from_n_modes(index_set, true_n_modes),
             index_set.weights,
         )
         n_modes = self._fft_storage_n_modes(n_modes_per_dim)
         starts = [
-            (max_modes - min(size, n_mode))
-            for (size, n_mode, max_modes) in zip(
-                fft_size, n_modes, max_n_modes
+            (practical_max_modes - min(size, n_mode))
+            for (size, n_mode, practical_max_modes) in zip(
+                fft_size, n_modes, practical_max_n_modes
             )
         ]
 
@@ -293,7 +293,7 @@ class RegularGridFFT(SpectralTransform):
         kept_modes = [
             min(size, n_mode, max_modes)
             for (size, n_mode, max_modes) in zip(
-                fft_size, n_modes, max_n_modes
+                fft_size, n_modes, practical_max_n_modes
             )
         ]
         slices_x = [slice(None), slice(None)]
@@ -451,9 +451,9 @@ class Rank1LatticeFFT(SpectralTransform):
         )
         return self.inverse_transform(x_fft, mode_sizes, state)
 
-    def weight_shape(self, index_set, true_max_n_modes):
+    def weight_shape(self, index_set, max_n_modes):
         if isinstance(index_set, HyperRectangleIndexSet):
-            return tuple(true_max_n_modes)
+            return tuple(max_n_modes)
         return (index_set.n_modes,)
 
     def selection(
@@ -462,7 +462,7 @@ class Rank1LatticeFFT(SpectralTransform):
         fft_size,
         max_n_modes,
         true_n_modes,
-        true_max_n_modes,
+        practical_max_n_modes,
         separable=False,
         device=None,
     ):
@@ -473,7 +473,7 @@ class Rank1LatticeFFT(SpectralTransform):
             tuple(fft_size),
             id(index_set),
             modes.shape[0],
-            tuple(true_max_n_modes),
+            tuple(max_n_modes),
             active_radius,
             self.complex_data,
             separable,
@@ -485,7 +485,7 @@ class Rank1LatticeFFT(SpectralTransform):
         coefficients, keep = self._coefficients(modes, fft_size, device)
         if isinstance(index_set, HyperRectangleIndexSet):
             max_n_modes_tensor = torch.as_tensor(
-                true_max_n_modes, device=device, dtype=torch.long
+                max_n_modes, device=device, dtype=torch.long
             )
             weight_coordinates = modes[keep] + max_n_modes_tensor // 2
             if separable:
