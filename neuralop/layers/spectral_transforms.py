@@ -69,7 +69,6 @@ class SpectralTransform(ABC):
         fft_size,
         max_n_modes,
         true_n_modes,
-        practical_max_n_modes,
         separable=False,
         device=None,
     ):
@@ -182,7 +181,6 @@ class RegularGridFFT(SpectralTransform):
         fft_size,
         max_n_modes,
         true_n_modes,
-        practical_max_n_modes,
         separable=False,
         device=None,
     ):
@@ -191,7 +189,6 @@ class RegularGridFFT(SpectralTransform):
             device,
             id(index_set),
             tuple(fft_size),
-            tuple(practical_max_n_modes),
             tuple(max_n_modes),
             active_radius,
             self.complex_data,
@@ -207,7 +204,6 @@ class RegularGridFFT(SpectralTransform):
                 fft_size=fft_size,
                 max_n_modes=max_n_modes,
                 true_n_modes=true_n_modes,
-                practical_max_n_modes=practical_max_n_modes,
                 separable=separable,
             )
         else:
@@ -257,19 +253,18 @@ class RegularGridFFT(SpectralTransform):
         fft_size,
         max_n_modes,
         true_n_modes,
-        practical_max_n_modes,
         separable=False,
     ):
-        practical_max_n_modes = self._fft_storage_n_modes(max_n_modes)
+        fft_max_n_modes = self._fft_storage_n_modes(max_n_modes)
         n_modes_per_dim = index_set.n_modes_per_dim_for_radius(
             radius_from_n_modes(index_set, true_n_modes),
             index_set.weights,
         )
         n_modes = self._fft_storage_n_modes(n_modes_per_dim)
         starts = [
-            (practical_max_modes - min(size, n_mode))
-            for (size, n_mode, practical_max_modes) in zip(
-                fft_size, n_modes, practical_max_n_modes
+            (fft_max_modes - min(size, n_mode))
+            for (size, n_mode, fft_max_modes) in zip(
+                fft_size, n_modes, fft_max_n_modes
             )
         ]
 
@@ -293,7 +288,7 @@ class RegularGridFFT(SpectralTransform):
         kept_modes = [
             min(size, n_mode, max_modes)
             for (size, n_mode, max_modes) in zip(
-                fft_size, n_modes, practical_max_n_modes
+                fft_size, n_modes, fft_max_n_modes
             )
         ]
         slices_x = [slice(None), slice(None)]
@@ -462,7 +457,6 @@ class Rank1LatticeFFT(SpectralTransform):
         fft_size,
         max_n_modes,
         true_n_modes,
-        practical_max_n_modes,
         separable=False,
         device=None,
     ):

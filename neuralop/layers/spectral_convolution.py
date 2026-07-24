@@ -367,22 +367,15 @@ class SpectralConv(BaseSpectralConv):
         # convention: for real-valued fields, the last dimension is reduced to
         # M // 2 + 1. self.true_n_modes keeps the unreduced active extents.
         # See the n_modes property below for the same convention during updates.
-        # convention: for real-valued fields, practical_max_n_modes stores the max 
-        # FFT-storage with the last dimension reduced to M // 2 + 1, 
-        # whereas max_n_modes stores the unreduced active extends.
+        # convention: max_n_modes stores the unreduced maximum active extends.
         self.n_modes = n_modes
 
         if max_n_modes is None:
-            self.practical_max_n_modes = list(self.n_modes)
-            max_n_modes = self.true_n_modes
+            max_n_modes = list(self.true_n_modes)
         elif isinstance(max_n_modes, int):
-            self.practical_max_n_modes = self._fft_storage_n_modes(max_n_modes)
             max_n_modes = [max_n_modes]
         else:
-            self.practical_max_n_modes = self._fft_storage_n_modes(max_n_modes)
             max_n_modes = list(max_n_modes)
-            
-        print(f"max_n_modes: {max_n_modes}")
         self.max_n_modes = max_n_modes
 
         self.fft_norm = fft_norm
@@ -581,7 +574,6 @@ class SpectralConv(BaseSpectralConv):
             fft_size=transform_state.fft_size,
             max_n_modes=self.max_n_modes,
             true_n_modes=self.true_n_modes,
-            practical_max_n_modes=self.practical_max_n_modes,
             separable=self.separable,
             device=x.device,
         )
