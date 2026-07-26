@@ -166,6 +166,7 @@ class FNOBlocks(nn.Module):
         decomposition_kwargs=dict(),
         enforce_hermitian_symmetry=True,
         mode_modulation: Optional[dict] = None,
+        norm_modulation: Optional[dict] = None,
         cond_embed_dim: Optional[int] = None,
     ):
         super().__init__()
@@ -221,6 +222,35 @@ class FNOBlocks(nn.Module):
         if self._mode_mod_enabled:
             extra_modulation_kwargs["mode_modulation"] = mode_modulation
             extra_modulation_kwargs["cond_embed_dim"] = cond_embed_dim
+
+        # Norm-modulation (FiLM / AdaGN) head. A small per-layer module maps the
+        # conditioning embedding e -> (scale, shift) for each of the block's two
+        # norm sites; the block applies (1 + scale) * Norm(x) + shift. 
+        self._norm_mod_enabled = norm_modulation is not None and norm_modulation.get(
+            "enabled", True
+        )
+        if self._norm_mod_enabled:
+            if cond_embed_dim is None:
+                raise ValueError(
+                    "norm_modulation is enabled but `cond_embed_dim` is None; the " \
+                    " FiLM head needs the conditioning-embedding width."
+                )
+            self.cond_embed_dim = int(cond_embed_dim)
+            film_hidden = int(norm_modulation.get("hidden_channels", 64))
+            # 4 * out_channels = (scale, shift) at each of the two norm sites.
+            self.film_heads = nn.ModuleList(
+                [
+                    ChannelMLP(
+                        in_channels=self.cond_embed_dim,
+                        out_channels=4 * self.out_channels,
+                        hidden_channels=film_hidden,
+                        n_dim=1,
+                    )
+                    for _ in range(n_layers)
+                ]
+            )
+        else:
+            self.film_heads = None
 
         # One conv per layer. Only resolution_scaling_factor varies by layer index
         self.convs = nn.ModuleList(
@@ -386,36 +416,56 @@ class FNOBlocks(nn.Module):
                     norm.set_embedding(embedding)
 
     def forward(
-        self, x, index=0, output_shape=None, mode_embedding=None, mod_params=None
+        self, x, index=0, output_shape=None, cond_embedding=None
     ):
         """Forward pass for one FNO layer.
 
         Parameters
         ----------
-        mode_embedding : torch.Tensor, optional
-            Precomputed conditioning embedding threaded to the spectral conv
-            for per-mode modulation. Used only when the block was built with
-            mode_modulation.
-        mod_params : dict, optional
-            Precomputed FiLM parameters applied around the norm layers. May
-            contain any of scale1/shift1/gate1/scale2/
-            shift2/gate2, each broadcast-ready over spatial axes. The
-            block only *applies* these; they are computed upstream (by
-            :class:`~neuralop.models.FNO`). FiLM is applied on the
-            post-activation path only.
+        cond_embedding : torch.Tensor, optional
+            Precomputed conditioning embedding e of shape
+            (B, cond_embed_dim), computed once upstream and threaded to every block. It
+            drives both pathways: per-mode modulation in the spectral conv
+            (when built with mode_modulation) and the block's own FiLM /
+            AdaGN head (when built with norm_modulation). Norm modulation is
+            applied on the post-activation path only.
         """
         if self.preactivation:
             return self.forward_with_preactivation(
-                x, index, output_shape, mode_embedding=mode_embedding
+                x, index, output_shape, cond_embedding=cond_embedding
             )
         else:
             return self.forward_with_postactivation(
-                x, index, output_shape,
-                mode_embedding=mode_embedding, mod_params=mod_params,
+                x, index, output_shape, cond_embedding=cond_embedding
             )
 
+    def _film_scale_shift(self, index, cond_embedding):
+        """
+        Per-site (scale, shift) from the conditioning embedding.
+        """
+        if cond_embedding is None:
+            raise ValueError(
+                "FNOBlocks has norm_modulation enabled; cond_embedding must "
+                "be provided."
+            )
+        if cond_embedding.shape[1] != self.cond_embed_dim:
+            raise ValueError(
+                f"cond_embedding has width {cond_embedding.shape[1]}, "
+                f"expected cond_embed_dim={self.cond_embed_dim}."
+            )
+        raw = self.film_heads[index](cond_embedding.unsqueeze(-1)).squeeze(-1)  # (B, 4C)
+        c = self.out_channels
+        spatial = (1,) * self.n_dim
+        batch = raw.shape[0]
+        return (
+            raw[:, 0 * c:1 * c].reshape(batch, c, *spatial),
+            raw[:, 1 * c:2 * c].reshape(batch, c, *spatial),
+            raw[:, 2 * c:3 * c].reshape(batch, c, *spatial),
+            raw[:, 3 * c:4 * c].reshape(batch, c, *spatial),
+        )
+
     def forward_with_postactivation(
-        self, x, index=0, output_shape=None, mode_embedding=None, mod_params=None
+        self, x, index=0, output_shape=None, cond_embedding=None
     ):
         if self.fno_skips is not None:
             x_skip_fno = self.fno_skips[index](x)
@@ -435,21 +485,20 @@ class FNOBlocks(nn.Module):
         # modulation is active; legacy convs keep the (x, output_shape) call.
         if self._mode_mod_enabled:
             x_fno = self.convs[index](
-                x, output_shape=output_shape, mode_embedding=mode_embedding
+                x, output_shape=output_shape, mode_embedding=cond_embedding
             )
         else:
             x_fno = self.convs[index](x, output_shape=output_shape)
 
+        scale1 = shift1 = scale2 = shift2 = None
+        if self._norm_mod_enabled:
+            scale1, shift1, scale2, shift2 = self._film_scale_shift(index, cond_embedding)
+
         if self.norm is not None:
             x_fno = self.norm[self.n_norms * index](x_fno)
 
-        # Apply precomputed FiLM around the first norm. The block only applies
-        # whichever params are present; they are computed upstream.
-        mp = mod_params or {}
-        if "scale1" in mp:
-            x_fno = x_fno * (1 + mp["scale1"]) + mp["shift1"]
-        if "gate1" in mp:
-            x_fno = x_fno * torch.sigmoid(mp["gate1"])
+        if scale1 is not None:
+            x_fno = x_fno * (1 + scale1) + shift1
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
@@ -458,8 +507,6 @@ class FNOBlocks(nn.Module):
 
         if self.use_channel_mlp:
             x_mlp = self.channel_mlp[index](x)
-            if "gate2" in mp:
-                x_mlp = x_mlp * torch.sigmoid(mp["gate2"])
             if self.channel_mlp_skips is not None:
                 x = x_mlp + x_skip_channel_mlp
             else:
@@ -468,8 +515,8 @@ class FNOBlocks(nn.Module):
         if self.norm is not None:
             x = self.norm[self.n_norms * index + 1](x)
 
-        if "scale2" in mp:
-            x = x * (1 + mp["scale2"]) + mp["shift2"]
+        if scale2 is not None:
+            x = x * (1 + scale2) + shift2
 
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
@@ -477,7 +524,7 @@ class FNOBlocks(nn.Module):
         return x
 
     def forward_with_preactivation(
-        self, x, index=0, output_shape=None, mode_embedding=None
+        self, x, index=0, output_shape=None, cond_embedding=None
     ):
         # Apply non-linear activation (and norm)
         # before this block's convolution/forward pass:
@@ -502,7 +549,7 @@ class FNOBlocks(nn.Module):
 
         if self._mode_mod_enabled:
             x_fno = self.convs[index](
-                x, output_shape=output_shape, mode_embedding=mode_embedding
+                x, output_shape=output_shape, mode_embedding=cond_embedding
             )
         else:
             x_fno = self.convs[index](x, output_shape=output_shape)
