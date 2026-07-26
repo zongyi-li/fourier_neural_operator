@@ -348,14 +348,8 @@ class FNO(BaseModel, name="FNO"):
             n_layers=n_layers,
             enforce_hermitian_symmetry=enforce_hermitian_symmetry,
             mode_modulation=mode_modulation if self._mode_mod_enabled else None,
+            norm_modulation=norm_modulation if self._norm_mod_enabled else None,
             cond_embed_dim=cond_embed_dim,
-        )
-
-        # FiLM (norm-modulation) heads live here, not in the block: their width
-        # depends on the block's channel count, so building them in the FNO
-        # keeps FNOBlocks as a pure applies-affine consumer of `mod_params`.
-        self._build_norm_modulator(
-            norm_modulation, cond_embed_dim, n_layers, hidden_channels
         )
 
         ## Lifting layer
@@ -385,75 +379,6 @@ class FNO(BaseModel, name="FNO"):
         )
         if self.complex_data:
             self.projection = ComplexValued(self.projection)
-
-    def _build_norm_modulator(
-        self, norm_modulation, cond_embed_dim, n_layers, out_channels
-    ):
-        """Build the per-layer FiLM heads that map the embedding `e` to the
-        scale/shift/gate params applied around each block's norm layers.
-
-        Each head is a ChannelMLP (cond_embed_dim -> total_out_dim).
-        Disabled specs are omitted from the output, so the head is sized to
-        exactly the enabled params.
-        """
-        self.norm_modulator = None
-        self._mod_slices = {}
-        if not self._norm_mod_enabled:
-            return
-
-        modulate1 = bool(norm_modulation.get("modulate1", True))
-        modulate1_gate = bool(norm_modulation.get("modulate1_gate", True))
-        modulate2 = bool(norm_modulation.get("modulate2", True))
-        modulate2_gate = bool(norm_modulation.get("modulate2_gate", True))
-        hidden_channels = int(norm_modulation.get("hidden_channels", 64))
-
-        # Spec for the head output: name, channel count, enabled flag.
-        specs = [
-            ("scale1", out_channels, modulate1),
-            ("shift1", out_channels, modulate1),
-            ("gate1", 1, modulate1_gate),
-            ("scale2", out_channels, modulate2),
-            ("shift2", out_channels, modulate2),
-            ("gate2", 1, modulate2_gate),
-        ]
-        offset = 0
-        for name, dim, enabled in specs:
-            if enabled:
-                self._mod_slices[name] = slice(offset, offset + dim)
-                offset += dim
-
-        total_out_dim = offset
-        if total_out_dim == 0:
-            return
-
-        self.norm_modulator = nn.ModuleList(
-            [
-                ChannelMLP(
-                    in_channels=cond_embed_dim,
-                    out_channels=total_out_dim,
-                    hidden_channels=hidden_channels,
-                    n_dim=1,
-                )
-                for _ in range(n_layers)
-            ]
-        )
-
-    def _film_params(self, e, layer_idx):
-        """Return the FiLM `mod_params` dict for a layer from embedding `e`.
-
-        Each value is shaped (B, dim, 1, ...) with self.n_dim trailing
-        singleton dims so it broadcasts over spatial axes. Disabled specs are
-        absent from the returned dict.
-        """
-        if self.norm_modulator is None:
-            return None
-        raw = self.norm_modulator[layer_idx](e.unsqueeze(-1))  # (B, total_out, 1)
-        spatial = (1,) * self.n_dim
-        params = {}
-        for name, sl in self._mod_slices.items():
-            v = raw[:, sl]
-            params[name] = v.reshape(v.shape[0], v.shape[1], *spatial)
-        return params
 
     def _prepare_conditioning(self, x, t):
         """Validate/normalize `t` to shape (B, n_params) and embed it.
@@ -545,10 +470,9 @@ class FNO(BaseModel, name="FNO"):
             x = self.domain_padding.pad(x)
 
         for layer_idx in range(self.n_layers):
-            mod_params = self._film_params(e, layer_idx) if e is not None else None
             x = self.fno_blocks(
                 x, layer_idx, output_shape=output_shape[layer_idx],
-                mode_embedding=e, mod_params=mod_params,
+                cond_embedding=e,
             )
 
         if self.domain_padding is not None:

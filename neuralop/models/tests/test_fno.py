@@ -313,11 +313,7 @@ def _mode_mod(mod_type="real"):
 
 
 def _norm_mod():
-    return {
-        "enabled": True, "hidden_channels": 16,
-        "modulate1": True, "modulate1_gate": True,
-        "modulate2": True, "modulate2_gate": True,
-    }
+    return {"enabled": True, "hidden_channels": 16}
 
 
 def test_fno_default_is_not_conditioned():
@@ -327,7 +323,7 @@ def test_fno_default_is_not_conditioned():
         hidden_channels=8, n_layers=2,
     )
     assert model._time_conditioned is False
-    assert model.norm_modulator is None
+    assert model.fno_blocks.film_heads is None
     x = torch.randn(2, 2, 12, 12)
     with torch.no_grad():
         torch.testing.assert_close(model(x), model(x, t=0.5))
