@@ -225,6 +225,136 @@ def test_FNOBlock_skip_connections_preactivation(fno_skip, channel_mlp_skip):
     assert res.shape == (2, 4, *size)
 
 
+# ----------------------------------------------------------------------
+# Optional conditioning pathways. The block threads a single precomputed
+# conditioning embedding cond_embedding (e) to its spectral conv (per-mode
+# modulation) and to its own FiLM / AdaGN head (norm modulation). The embedding
+# is computed once upstream by the FNO; these tests exercise the block alone.
+
+
+def _mode_mod(mod_type="real", k_embed_dim=8, type_k="power"):
+    return {
+        "enabled": True,
+        "type": mod_type,
+        "hidden_channels": 16,
+        "k_embed_dim": k_embed_dim,
+        "type_k": type_k,
+    }
+
+
+def _norm_mod(hidden_channels=16):
+    return {"enabled": True, "hidden_channels": hidden_channels}
+
+
+@pytest.mark.parametrize("norm", [None, "group_norm", "instance_norm"])
+def test_block_default_ignores_cond_embedding(norm):
+    """A block built without either modulation ignores cond_embedding."""
+    torch.manual_seed(0)
+    block = FNOBlocks(2, 2, (6, 6), n_layers=2, norm=norm)
+    assert not block._mode_mod_enabled
+    assert not block._norm_mod_enabled
+    x = torch.randn(2, 2, 10, 10)
+    y_plain = block(x, index=0)
+    y_emb = block(x, index=0, cond_embedding=torch.randn(2, 8))
+    torch.testing.assert_close(y_plain, y_emb)
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_mode_modulation_forward(mod_type):
+    torch.manual_seed(0)
+    cond_embed_dim = 10
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=2, norm="group_norm",
+        mode_modulation=_mode_mod(mod_type), cond_embed_dim=cond_embed_dim,
+    )
+    x = torch.randn(2, 2, 10, 10)
+    e = torch.randn(2, cond_embed_dim)
+    y = block(x, index=0, cond_embedding=e)
+    assert y.shape == (2, 2, 10, 10)
+    assert torch.isfinite(y).all()
+
+
+def test_block_mode_modulation_requires_embedding():
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=2,
+        mode_modulation=_mode_mod("real"), cond_embed_dim=8,
+    )
+    with pytest.raises(ValueError, match="mode_embedding"):
+        block(torch.randn(2, 2, 10, 10), index=0)
+
+
+def test_block_norm_modulation_requires_cond_embed_dim():
+    """norm_modulation enabled without cond_embed_dim raises at build time."""
+    with pytest.raises(ValueError, match="cond_embed_dim"):
+        FNOBlocks(2, 2, (6, 6), n_layers=1, norm="group_norm",
+                  norm_modulation=_norm_mod())
+
+
+def test_block_norm_modulation_requires_embedding():
+    """norm_modulation on, but no cond_embedding passed to forward -> raises."""
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=1, norm="group_norm",
+        norm_modulation=_norm_mod(), cond_embed_dim=8,
+    )
+    with pytest.raises(ValueError, match="cond_embedding"):
+        block(torch.randn(2, 2, 10, 10), index=0)
+
+
+def test_block_norm_modulation_zero_head_is_identity():
+    """With the FiLM head zeroed, (1 + 0) * Norm(x) + 0 == the unconditioned
+    path, so norm modulation is a no-op."""
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=1, norm="group_norm",
+        norm_modulation=_norm_mod(), cond_embed_dim=8,
+    )
+    x = torch.randn(2, 2, 10, 10)
+    e = torch.randn(2, 8)
+    for p in block.film_heads.parameters():
+        torch.nn.init.zeros_(p)
+    y_mod = block(x, index=0, cond_embedding=e)
+    block._norm_mod_enabled = False  # same weights, modulation path off
+    y_ref = block(x, index=0)
+    torch.testing.assert_close(y_mod, y_ref)
+
+
+def test_block_norm_modulation_changes_output_and_backprops():
+    """A non-trivial FiLM head changes the output and grads reach it."""
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=1, norm="group_norm",
+        norm_modulation=_norm_mod(), cond_embed_dim=8,
+    )
+    x = torch.randn(2, 2, 10, 10)
+    e = torch.randn(2, 8)
+    y_mod = block(x, index=0, cond_embedding=e)
+    block._norm_mod_enabled = False
+    y_ref = block(x, index=0)
+    block._norm_mod_enabled = True
+    assert not torch.allclose(y_mod, y_ref)
+    y_mod.sum().backward()
+    for name, p in block.film_heads.named_parameters():
+        assert p.grad is not None, f"no grad for film_heads.{name}"
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_mode_and_norm_backward(mod_type):
+    """Both pathways together: grads reach x and every block parameter."""
+    torch.manual_seed(0)
+    cond_embed_dim = 8
+    block = FNOBlocks(
+        2, 2, (6, 6), n_layers=1, norm="group_norm",
+        mode_modulation=_mode_mod(mod_type),
+        norm_modulation=_norm_mod(), cond_embed_dim=cond_embed_dim,
+    )
+    x = torch.randn(2, 2, 10, 10, requires_grad=True)
+    e = torch.randn(2, cond_embed_dim)
+    y = block(x, index=0, cond_embedding=e)
+    y.sum().backward()
+    assert x.grad is not None
+    for name, param in block.named_parameters():
+        assert param.grad is not None, f"no grad for {name}"
+
 @pytest.mark.parametrize("n_dim", [1, 2, 3])
 def test_FNOBlock_conv_bias_kernel(n_dim):
     """Test local convolutional bias kernels beside spectral convolution."""

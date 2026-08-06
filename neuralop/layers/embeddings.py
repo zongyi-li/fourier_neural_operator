@@ -404,3 +404,86 @@ def apply_rotary_pos_emb(t, freqs):
     Formula: see equation (34) in https://arxiv.org/pdf/2104.09864.pdf
     """
     return (t * freqs.cos()) + (rotate_half(t) * freqs.sin())
+
+
+class ConditioningEmbedding(Embedding):
+    """Embed conditioning parameters for time/parameter-conditioned operators.
+
+    Maps a batch of conditioning parameters ``t`` of shape ``(B, P)`` to an
+    embedding ``e`` of shape ``(B, P * embed_dim)`` by embedding each of the
+    ``P`` parameters independently and concatenating. This is the single place
+    where the parameter embedding ``phi_t`` is computed; the FNO computes it
+    once in ``forward`` and threads the result to the spectral convs (per-mode
+    modulation) and to the FiLM heads (norm modulation), so the modulation
+    layers themselves never recompute it.
+
+    Two feature maps are supported:
+
+    - ``'sinusoidal'`` (default): ``[sin(t * w), cos(t * w)]`` with
+      ``w = r ** (-2i / embed_dim)``. Valid for **any** real ``t``.
+    - ``'power'``: ``t ** p`` with ``p in linspace(alpha, 0, embed_dim)``.
+      Only defined for ``t > 0``; ``forward`` raises for non-positive ``t``
+      rather than silently returning a degenerate embedding.
+
+    Parameters
+    ----------
+    embed_dim : int, optional
+        Per-parameter embedding width ``D``. Default 32.
+    n_params : int, optional
+        Number of conditioning parameters ``P``. Default 1 (scalar
+        conditioning). The output width is ``P * embed_dim``.
+    type_t : {'sinusoidal', 'power'}, optional
+        Feature map. Default ``'sinusoidal'``.
+    alpha : float, optional
+        Exponent range for the power embedding. Default ``-2.0``.
+    r : float, optional
+        Base for the sinusoidal embedding frequencies. Default ``10000.0``.
+    """
+
+    def __init__(self, embed_dim=32, n_params=1, type_t="sinusoidal",
+                 alpha=-2.0, r=10000.0):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.n_params = int(n_params)
+        self.type_t = type_t
+
+        if type_t == "power":
+            self.register_buffer("t_powers", torch.linspace(alpha, 0.0, self.embed_dim))
+        elif type_t == "sinusoidal":
+            indices = torch.arange(0, self.embed_dim // 2, dtype=torch.float32)
+            self.register_buffer("t_inv_freqs", r ** (-2.0 * indices / self.embed_dim))
+        else:
+            raise ValueError(f"Unknown ConditioningEmbedding type_t: {type_t!r}")
+
+    @property
+    def out_channels(self):
+        """Width of the produced embedding, ``n_params * embed_dim``."""
+        return self.n_params * self.embed_dim
+
+    @property
+    def out_dim(self):
+        """Alias for :attr:`out_channels`."""
+        return self.out_channels
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """Embed ``t`` of shape ``(B, P)`` into ``(B, P * embed_dim)``."""
+        embeds = []
+        for p in range(self.n_params):
+            tp = t[:, p: p + 1]  # (B, 1)
+            if self.type_t == "power":
+                # Power embedding is only defined for positive t. Fail loudly
+                # rather than silently zeroing the embedding for t <= 0.
+                # Sinusoidal is valid for any real t, so it is left unguarded.
+                if not torch.all(tp > 0):
+                    raise ValueError(
+                        "ConditioningEmbedding type_t='power' requires t > 0; "
+                        f"got t[:, {p}].min()={tp.min().item()}."
+                    )
+                tp_embed = tp ** self.t_powers.unsqueeze(0)
+            else:  # sinusoidal
+                tp_scaled = tp * self.t_inv_freqs.unsqueeze(0)
+                tp_embed = torch.cat(
+                    [torch.sin(tp_scaled), torch.cos(tp_scaled)], dim=-1
+                )
+            embeds.append(tp_embed)
+        return torch.cat(embeds, dim=-1)

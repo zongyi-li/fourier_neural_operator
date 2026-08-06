@@ -113,3 +113,134 @@ def test_SpectralConv2(enforce_hermitian_symmetry, dim, spatial_size, modes, res
     assert res.shape == (2, 4, *out_size)
     assert res.dtype == torch.float32
     assert not torch.is_complex(res)
+
+
+# Optional per-mode modulation pathway the caller
+# passes a precomputed embedding `e` of shape (B, cond_embed_dim) as
+# `mode_embedding`. Only phi_k and the [e, phi_k] -> factor projection live
+# in the conv. These tests exercise that contract directly, without the FNO.
+
+
+def _mode_mod(mod_type="real", k_embed_dim=8, type_k="power"):
+    return {
+        "enabled": True,
+        "type": mod_type,
+        "hidden_channels": 16,
+        "k_embed_dim": k_embed_dim,
+        "type_k": type_k,
+    }
+
+
+def test_modulator_default_disabled():
+    """A default SpectralConv has no modulator and ignores `mode_embedding`."""
+    layer = SpectralConv(2, 3, (6, 6))
+    assert layer.modulator is None
+    x = torch.randn(2, 2, 10, 10)
+    y_plain = layer(x)
+    # Passing an embedding to an unmodulated conv is a silent no-op.
+    y_emb = layer(x, mode_embedding=torch.randn(2, 16))
+    torch.testing.assert_close(y_plain, y_emb)
+
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+@pytest.mark.parametrize("type_k", ["power", "sinusoidal"])
+def test_modulated_forward_shape(dim, mod_type, type_k):
+    torch.manual_seed(0)
+    n_modes = (6,) * dim
+    spatial = (10,) * dim
+    cond_embed_dim = 10
+
+    layer = SpectralConv(
+        2, 3, n_modes,
+        mode_modulation=_mode_mod(mod_type, type_k=type_k),
+        cond_embed_dim=cond_embed_dim,
+    )
+
+    x = torch.randn(2, 2, *spatial)
+    e = torch.randn(2, cond_embed_dim)
+    y = layer(x, mode_embedding=e)
+    assert y.shape == (2, 3, *spatial)
+    assert torch.isfinite(y).all()
+
+
+def test_modulated_backward_grad_matches_finite_difference():
+    """The modulated conv is affine in x (the modulation factor depends only
+    on the embedding and mode index, not on x), so the directional derivative
+    equals central finite differences exactly in real arithmetic. Using a
+    unit step avoids catastrophic cancellation, leaving only float rounding."""
+    torch.manual_seed(0)
+    cond_embed_dim = 6
+    layer = SpectralConv(
+        2, 2, (6, 6),
+        mode_modulation=_mode_mod("polar"),
+        cond_embed_dim=cond_embed_dim,
+    )
+
+    x = torch.randn(2, 2, 8, 8, requires_grad=True)
+    e = torch.randn(2, cond_embed_dim)
+    w = torch.randn(2, 2, 8, 8)   # fixed cotangent
+    v = torch.randn(2, 2, 8, 8)   # fixed direction
+
+    loss = (layer(x, mode_embedding=e) * w).sum()
+    (grad_x,) = torch.autograd.grad(loss, x)
+    analytic = (grad_x * v).sum()
+
+    eps = 1.0  # exact for an affine map; larger step minimizes rounding
+    with torch.no_grad():
+        lp = (layer(x + eps * v, mode_embedding=e) * w).sum()
+        lm = (layer(x - eps * v, mode_embedding=e) * w).sum()
+    fd = (lp - lm) / (2 * eps)
+
+    torch.testing.assert_close(analytic, fd, rtol=1e-4, atol=1e-4)
+
+
+def test_missing_embedding_when_enabled_raises():
+    layer = SpectralConv(
+        2, 3, (6, 6), mode_modulation=_mode_mod("real"), cond_embed_dim=8
+    )
+    with pytest.raises(ValueError, match="mode_embedding"):
+        layer(torch.randn(2, 2, 10, 10))
+
+
+def test_wrong_embedding_width_raises():
+    layer = SpectralConv(
+        2, 3, (6, 6), mode_modulation=_mode_mod("real"), cond_embed_dim=8
+    )
+    with pytest.raises(ValueError, match="cond_embed_dim"):
+        layer(torch.randn(2, 2, 10, 10), mode_embedding=torch.randn(2, 5))
+
+
+def test_modulation_without_cond_embed_dim_raises():
+    with pytest.raises(ValueError, match="cond_embed_dim"):
+        SpectralConv(2, 3, (6, 6), mode_modulation=_mode_mod("real"))
+
+
+def test_enabled_flag_false_is_inert():
+    """mode_modulation={'enabled': False, ...} behaves like no modulation."""
+    layer = SpectralConv(
+        2, 3, (6, 6),
+        mode_modulation={"enabled": False, "type": "real"},
+        cond_embed_dim=8,
+    )
+    assert layer.modulator is None
+    y = layer(torch.randn(2, 2, 10, 10))
+    assert y.shape == (2, 3, 10, 10)
+
+
+def test_unknown_modulation_type_raises():
+    with pytest.raises(ValueError, match="mode_modulation"):
+        SpectralConv(
+            2, 3, (6, 6),
+            mode_modulation={"enabled": True, "type": "bogus"},
+            cond_embed_dim=8,
+        )
+
+
+def test_unknown_type_k_raises():
+    with pytest.raises(ValueError, match="type_k"):
+        SpectralConv(
+            2, 3, (6, 6),
+            mode_modulation=_mode_mod("real", type_k="bogus"),
+            cond_embed_dim=8,
+        )
