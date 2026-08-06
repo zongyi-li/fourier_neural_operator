@@ -381,7 +381,7 @@ class SpectralConv(BaseSpectralConv):
             self.bias = None
 
     def transform(self, x, output_shape=None):
-        in_shape = list(x.shape[2:])
+        in_shape = tuple(x.shape[2:])
 
         if self.resolution_scaling_factor is not None and output_shape is None:
             out_shape = tuple(
