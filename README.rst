@@ -83,6 +83,8 @@ of an equivalent, dense Fourier Neural Operator!
 To use W&B logging features, simply create a file in ``neuraloperator/config`` 
 called ``wandb_api_key.txt`` and paste your W&B API key there.
 
+Hyperparameter optimization (HPO) scripts using `HyperNOs` and `Ray Tune` are also available in the ``scripts/`` directory (e.g. ``scripts/ray_tune_tfno_darcy.py``).
+
 
 ============
 Contributing
