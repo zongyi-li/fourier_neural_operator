@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from ..fno_block import FNOBlocks
 
 
@@ -248,3 +249,31 @@ def test_FNOBlock_conv_bias_kernel(n_dim):
     assert res.shape == (2, 4, *size[:n_dim])
     assert block.conv_bias_kernel == conv_bias_kernel
     assert block.fno_skips[0].kernel_size == (conv_bias_kernel,) * n_dim
+
+
+def test_FNOBlock_no_double_nonlinearity():
+    """Regression test for issue #728: non-linearity must not be applied twice when use_channel_mlp=False."""
+    call_count = 0
+
+    def counting_nonlin(x):
+        nonlocal call_count
+        call_count += 1
+        return F.gelu(x)
+
+    n_layers = 3
+    block = FNOBlocks(
+        3,
+        3,
+        (8, 8),
+        n_layers=n_layers,
+        use_channel_mlp=False,
+        non_linearity=counting_nonlin,
+    )
+    x = torch.randn(2, 3, 16, 16)
+    for i in range(n_layers):
+        call_count = 0
+        x = block(x, index=i)
+        expected = 1 if i < n_layers - 1 else 0
+        assert call_count == expected, (
+            f"Layer {i}: expected {expected} non-linearity call(s), got {call_count}"
+        )

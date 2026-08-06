@@ -311,8 +311,9 @@ class FNOBlocks(nn.Module):
                     [ComplexValued(x) for x in self.channel_mlp_skips]
                 )
 
-        # Each block will have 2 norms if we also use a ChannelMLP
-        self.n_norms = 2
+        # Each block has 2 norms when using ChannelMLP (one after FNO conv, one after MLP),
+        # but only 1 when channel MLP is disabled.
+        self.n_norms = 2 if self.use_channel_mlp else 1
         if norm is None:
             self.norm = None
         elif norm == "instance_norm":
@@ -405,11 +406,11 @@ class FNOBlocks(nn.Module):
             else:
                 x = self.channel_mlp[index](x)
 
-        if self.norm is not None:
-            x = self.norm[self.n_norms * index + 1](x)
+            if self.norm is not None:
+                x = self.norm[self.n_norms * index + 1](x)
 
-        if index < (self.n_layers - 1):
-            x = self.non_linearity(x)
+            if index < (self.n_layers - 1):
+                x = self.non_linearity(x)
 
         return x
 
@@ -442,10 +443,10 @@ class FNOBlocks(nn.Module):
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
 
-        if self.norm is not None:
-            x = self.norm[self.n_norms * index + 1](x)
-
         if self.use_channel_mlp:
+            if self.norm is not None:
+                x = self.norm[self.n_norms * index + 1](x)
+
             if self.channel_mlp_skips is not None:
                 x = self.channel_mlp[index](x) + x_skip_channel_mlp
             else:
