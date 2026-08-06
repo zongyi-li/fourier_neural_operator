@@ -108,7 +108,7 @@ def download_from_url(
                     # print progress dynamically
                     curr_size += chunk_size
                     prog = curr_size / size
-                    print(f"Download in progress: {prog:.2%}", end="\r")
+                    print(f"Download in progress: {prog:.2%}".ljust(40), end="\r")
 
             assert (
                 fpath.stat().st_size == size
