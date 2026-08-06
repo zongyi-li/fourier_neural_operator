@@ -9,6 +9,7 @@ import tensorly as tl
 from tensorly.plugins import use_opt_einsum
 from tltorch.factorized_tensors.core import FactorizedTensor
 
+from .channel_mlp import ChannelMLP
 from .einsum_utils import einsum_complexhalf
 from .base_spectral_conv import BaseSpectralConv
 from .resample import resample
@@ -271,6 +272,33 @@ class SpectralConv(BaseSpectralConv):
         FFT normalization parameter, by default 'forward'.
     device : torch.device or None, optional
         Device to place the layer on, by default None.
+    mode_modulation : dict or None, optional
+        Configuration for the optional per-mode modulation pathway. When set,
+        the layer multiplies the kept spectral coefficients by a learned
+        (e, k)-dependent factor before the weight contraction, where
+        e is a precomputed conditioning embedding passed to forward as
+        mode_embedding (see :class:`neuralop.layers.ConditioningEmbedding`).
+        Only the frequency-mode embedding phi_k and the thin projection
+        [e, phi_k] -> factor live here, since they are tied to this layer's
+        own mode grid. Keys:
+
+        - enabled : bool, default True. If False the layer ignores
+          mode_embedding and behaves like a vanilla :class:`SpectralConv`.
+        - type : 'real', 'complex', or 'polar' (magnitude-preserving).
+        - hidden_channels : int, default 64. Width of the projection MLP.
+        - k_embed_dim : int, default 32. Frequency-embedding dimension.
+        - type_k : 'power' (default) or 'sinusoidal'.
+        - alpha : float, default -2.0. Exponent range for the power
+          frequency embedding.
+        - r : float, default 10000.0. Base for sinusoidal frequencies.
+
+        By default None; no mode modulation is applied and
+        forward ignores mode_embedding.
+
+    cond_embed_dim : int or None, optional
+            Width of the precomputed conditioning embedding e that forward
+            receives via mode_embedding. Required when mode_modulation is
+            enabled; it sizes the input of the projection MLP. By default None.
 
     References
     ----------
@@ -302,6 +330,8 @@ class SpectralConv(BaseSpectralConv):
         init_std="auto",
         fft_norm="forward",
         device=None,
+        mode_modulation: Optional[dict] = None,
+        cond_embed_dim: Optional[int] = None,
     ):
         super().__init__(device=device)
 
@@ -380,6 +410,147 @@ class SpectralConv(BaseSpectralConv):
         else:
             self.bias = None
 
+        # Optional per-mode modulation pathway. When mode_modulation is None
+        # (the default) self.modulator is None and forward is identical to the
+        # unmodulated spectral conv. The conditioning embedding is computed
+        # upstream and passed to forward; this layer owns only the
+        # frequency-mode embedding phi_k and the thin [e, phi_k] -> factor
+        # projection, both tied to its own mode grid.
+        self._build_modulator(mode_modulation, cond_embed_dim)
+
+    def _build_modulator(
+        self, mode_modulation: Optional[dict], cond_embed_dim: Optional[int]
+    ) -> None:
+        self._k_grid_cache = {}
+        self.mode_modulation_config = mode_modulation
+        if mode_modulation is None or not mode_modulation.get("enabled", True):
+            self.modulator = None
+            return
+
+        if cond_embed_dim is None:
+            raise ValueError(
+                "mode_modulation is enabled but `cond_embed_dim` is None; the "
+                "width of the precomputed conditioning embedding must be given."
+            )
+
+        self.cond_embed_dim = int(cond_embed_dim)
+        self.modulation_type = mode_modulation.get("type")
+        self.modulation_hidden_channels = mode_modulation.get("hidden_channels", 64)
+
+        # Frequency-mode (phi_k) embedding. It stays in the conv because it
+        # depends on this layer's own mode grid.
+        self.k_embed_dim = int(mode_modulation.get("k_embed_dim", 32))
+        self.type_k = mode_modulation.get("type_k", "power")
+        alpha = mode_modulation.get("alpha", -2.0)
+        r = mode_modulation.get("r", 10000.0)
+
+        if self.type_k == "power":
+            self.register_buffer("k_powers", torch.linspace(alpha, 0.0, self.k_embed_dim))
+        elif self.type_k == "sinusoidal":
+            indices = torch.arange(0, self.k_embed_dim // 2, dtype=torch.float32)
+            self.register_buffer("k_inv_freqs", r ** (-2.0 * indices / self.k_embed_dim))
+        else:
+            raise ValueError(f"Unknown mode_modulation['type_k']: {self.type_k!r}")
+
+        # Projection input: cond_embed_dim (t) + order * k_embed_dim (k).
+        in_features = self.cond_embed_dim + self.k_embed_dim * self.order
+
+        if self.modulation_type in ("real", "polar"):
+            mod_out_channels = self.in_channels
+        elif self.modulation_type == "complex":
+            mod_out_channels = self.in_channels * 2
+        else:
+            raise ValueError(
+                f"Unknown mode_modulation['type']: {self.modulation_type!r}"
+            )
+
+        self.modulator = ChannelMLP(
+            in_channels=in_features,
+            out_channels=mod_out_channels,
+            hidden_channels=self.modulation_hidden_channels,
+            n_dim=self.order,
+        )
+
+    def embed_k(self, shape: Tuple[int, ...], device=None) -> torch.Tensor:
+        """Embed the per-axis frequency-mode index grid for the kept modes.
+
+        Parameters
+        ----------
+        shape : tuple of int
+            Shape of the kept-mode grid; for real FFT the last axis is
+            S_N // 2 + 1.
+        device : torch.device or None
+            Device for the returned tensor.
+
+        Returns
+        -------
+        torch.Tensor of shape (1, order * k_embed_dim, *shape).
+        """
+        embed_type = self.type_k
+        n_dims = len(shape)
+
+        cache_key = (tuple(shape), device)
+        if cache_key not in self._k_grid_cache:
+            k_ranges = []
+            for i, Si in enumerate(shape):
+                if i < n_dims - 1:
+                    modes_i = Si // 2
+                    k_ranges.append(torch.arange(-modes_i, Si - modes_i, device=device))
+                else:
+                    k_ranges.append(torch.arange(0, Si, device=device))
+            k_grid = torch.stack(
+                torch.meshgrid(*k_ranges, indexing="ij"), dim=0
+            ).unsqueeze(0)
+            self._k_grid_cache[cache_key] = k_grid
+        else:
+            k_grid = self._k_grid_cache[cache_key]
+
+        if embed_type == "power":
+            sign = torch.sign(k_grid)
+            k_embed = sign.unsqueeze(2) * (
+                k_grid.abs().clamp_min(1.0).unsqueeze(2)
+                ** self.k_powers.view(1, 1, -1, *([1] * n_dims))
+            )
+        else:  # 'sinusoidal'
+            k_scaled = k_grid.unsqueeze(2) * self.k_inv_freqs.view(
+                1, 1, -1, *([1] * n_dims)
+            )
+            k_embed = torch.cat([torch.sin(k_scaled), torch.cos(k_scaled)], dim=2)
+
+        return k_embed.reshape(1, -1, *shape)
+
+    def _modulation_factor(
+        self, t_feature: torch.Tensor, k_feature: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size = t_feature.shape[0]
+        spatial_shape = t_feature.shape[2:]
+
+        combined = torch.cat(
+            [t_feature, k_feature.expand(batch_size, -1, *spatial_shape)],
+            dim=1,
+        )
+
+        if self.modulation_type == "real":
+            return self.modulator(combined)
+        if self.modulation_type == "complex":
+            mlp_out = self.modulator(combined)
+            # Complex modulator output was sized to 2 * in_channels in
+            # `_build_modulator`; the first half is the real part and the
+            # second half is the imaginary part of a per-mode complex
+            # multiplier. The factor multiplies the kept FFT input, which has
+            # `in_channels` channels, so the split width must be `in_channels`.
+            return torch.complex(
+                mlp_out[:, : self.in_channels, ...],
+                mlp_out[:, self.in_channels:, ...],
+            )
+        # 'polar'
+        theta = self.modulator(combined)
+        return torch.exp(1j * theta)
+
+    def clear_cache(self) -> None:
+        """Drop any cached frequency-mode index grids."""
+        self._k_grid_cache.clear()
+
     def transform(self, x, output_shape=None):
         in_shape = list(x.shape[2:])
 
@@ -414,13 +585,22 @@ class SpectralConv(BaseSpectralConv):
             n_modes[-1] = n_modes[-1] // 2 + 1
         self._n_modes = n_modes
 
-    def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        output_shape: Optional[Tuple[int]] = None,
+        mode_embedding: Optional[torch.Tensor] = None,
+    ):
         """Generic forward pass for the Factorized Spectral Conv
 
         Parameters
         ----------
         x : torch.Tensor
             input activation of size (batch_size, channels, d1, ..., dN)
+        mode_embedding : torch.Tensor, optional
+            Precomputed conditioning embedding of shape ``(B, cond_embed_dim)``.
+            Required when mode modulation is enabled (``mode_modulation`` set at
+            construction); ignored otherwise.
 
         Returns
         -------
@@ -517,9 +697,44 @@ class SpectralConv(BaseSpectralConv):
             slices_x[-1] = slice(None)
 
         slices_x = tuple(slices_x)
-        out_fft[slices_x] = self._contract(
-            x[slices_x], weight, separable=self.separable
-        )
+
+        # Optional per-mode modulation: multiply the kept spectral coefficients
+        # by a learned (e, k)-dependent factor before the weight contraction.
+        # The conditioning embedding `e` is precomputed upstream and passed in
+        # as `mode_embedding`; only phi_k and the projection to the per-mode
+        # factor live here (tied to this layer's mode grid).
+        #
+        # Hermitian note: for real spatial data the factor is generally *not*
+        # Hermitian (e.g. a polar exp(1j*theta) factor), so the Hermitian
+        # enforcement below (zeroing imag at DC and Nyquist) clips the
+        # modulation at those two bins to keep the irfft output real. This is
+        # intentional: the modulator shapes mid-band frequencies freely while
+        # DC/Nyquist stay real-valued.
+        if self.modulator is not None:
+            if mode_embedding is None:
+                raise ValueError(
+                    "SpectralConv has mode_modulation enabled; `mode_embedding` "
+                    "must be provided."
+                )
+            if mode_embedding.shape[1] != self.cond_embed_dim:
+                raise ValueError(
+                    f"mode_embedding has width {mode_embedding.shape[1]}, "
+                    f"expected cond_embed_dim={self.cond_embed_dim}."
+                )
+            kept_shape = tuple(weight.shape[weight_start_idx:])
+            # Broadcast the per-sample embedding (B, cond_embed_dim) over the
+            # kept-mode grid; phi_t itself is computed upstream.
+            batch_size = mode_embedding.shape[0]
+            t_feature = mode_embedding.reshape(
+                batch_size, -1, *([1] * len(kept_shape))
+            ).expand(batch_size, -1, *kept_shape)
+            k_embed = self.embed_k(shape=kept_shape, device=x.device)
+            mod_factor = self._modulation_factor(t_feature, k_embed)
+            x_kept = x[slices_x] * mod_factor
+        else:
+            x_kept = x[slices_x]
+
+        out_fft[slices_x] = self._contract(x_kept, weight, separable=self.separable)
 
         if self.resolution_scaling_factor is not None and output_shape is None:
             mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])

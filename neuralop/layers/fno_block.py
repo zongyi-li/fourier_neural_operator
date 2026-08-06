@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import nn
@@ -165,6 +165,9 @@ class FNOBlocks(nn.Module):
         implementation="factorized",
         decomposition_kwargs=dict(),
         enforce_hermitian_symmetry=True,
+        mode_modulation: Optional[dict] = None,
+        norm_modulation: Optional[dict] = None,
+        cond_embed_dim: Optional[int] = None,
     ):
         super().__init__()
         if isinstance(n_modes, int):
@@ -206,6 +209,49 @@ class FNOBlocks(nn.Module):
         else:
             self.non_linearity = non_linearity
 
+        # Track whether the per-mode modulation pathway is active, so forward
+        # only threads the precomputed `mode_embedding` to the conv when it is.
+        self._mode_mod_enabled = mode_modulation is not None and mode_modulation.get(
+            "enabled", True
+        )
+
+        # Extra kwargs that only modulation-aware conv modules accept. We
+        # forward them only when modulation is requested, so legacy conv
+        # modules continue to work unchanged on the default path.
+        extra_modulation_kwargs = {}
+        if self._mode_mod_enabled:
+            extra_modulation_kwargs["mode_modulation"] = mode_modulation
+            extra_modulation_kwargs["cond_embed_dim"] = cond_embed_dim
+
+        # Norm-modulation (FiLM / AdaGN) head. A small per-layer module maps the
+        # conditioning embedding e -> (scale, shift) for each of the block's two
+        # norm sites; the block applies (1 + scale) * Norm(x) + shift. 
+        self._norm_mod_enabled = norm_modulation is not None and norm_modulation.get(
+            "enabled", True
+        )
+        if self._norm_mod_enabled:
+            if cond_embed_dim is None:
+                raise ValueError(
+                    "norm_modulation is enabled but `cond_embed_dim` is None; the " \
+                    " FiLM head needs the conditioning-embedding width."
+                )
+            self.cond_embed_dim = int(cond_embed_dim)
+            film_hidden = int(norm_modulation.get("hidden_channels", 64))
+            # 4 * out_channels = (scale, shift) at each of the two norm sites.
+            self.film_heads = nn.ModuleList(
+                [
+                    ChannelMLP(
+                        in_channels=self.cond_embed_dim,
+                        out_channels=4 * self.out_channels,
+                        hidden_channels=film_hidden,
+                        n_dim=1,
+                    )
+                    for _ in range(n_layers)
+                ]
+            )
+        else:
+            self.film_heads = None
+
         # One conv per layer. Only resolution_scaling_factor varies by layer index
         self.convs = nn.ModuleList(
             [
@@ -234,6 +280,7 @@ class FNOBlocks(nn.Module):
                         if issubclass(conv_module, SpectralConv)
                         else {}
                     ),
+                    **extra_modulation_kwargs,
                 )
                 for i in range(n_layers)
             ]
@@ -368,13 +415,58 @@ class FNOBlocks(nn.Module):
                 for norm, embedding in zip(self.norm, embeddings):
                     norm.set_embedding(embedding)
 
-    def forward(self, x, index=0, output_shape=None):
-        if self.preactivation:
-            return self.forward_with_preactivation(x, index, output_shape)
-        else:
-            return self.forward_with_postactivation(x, index, output_shape)
+    def forward(
+        self, x, index=0, output_shape=None, cond_embedding=None
+    ):
+        """Forward pass for one FNO layer.
 
-    def forward_with_postactivation(self, x, index=0, output_shape=None):
+        Parameters
+        ----------
+        cond_embedding : torch.Tensor, optional
+            Precomputed conditioning embedding e of shape
+            (B, cond_embed_dim), computed once upstream and threaded to every block. It
+            drives both pathways: per-mode modulation in the spectral conv
+            (when built with mode_modulation) and the block's own FiLM /
+            AdaGN head (when built with norm_modulation). Norm modulation is
+            applied on the post-activation path only.
+        """
+        if self.preactivation:
+            return self.forward_with_preactivation(
+                x, index, output_shape, cond_embedding=cond_embedding
+            )
+        else:
+            return self.forward_with_postactivation(
+                x, index, output_shape, cond_embedding=cond_embedding
+            )
+
+    def _film_scale_shift(self, index, cond_embedding):
+        """
+        Per-site (scale, shift) from the conditioning embedding.
+        """
+        if cond_embedding is None:
+            raise ValueError(
+                "FNOBlocks has norm_modulation enabled; cond_embedding must "
+                "be provided."
+            )
+        if cond_embedding.shape[1] != self.cond_embed_dim:
+            raise ValueError(
+                f"cond_embedding has width {cond_embedding.shape[1]}, "
+                f"expected cond_embed_dim={self.cond_embed_dim}."
+            )
+        raw = self.film_heads[index](cond_embedding.unsqueeze(-1)).squeeze(-1)  # (B, 4C)
+        c = self.out_channels
+        spatial = (1,) * self.n_dim
+        batch = raw.shape[0]
+        return (
+            raw[:, 0 * c:1 * c].reshape(batch, c, *spatial),
+            raw[:, 1 * c:2 * c].reshape(batch, c, *spatial),
+            raw[:, 2 * c:3 * c].reshape(batch, c, *spatial),
+            raw[:, 3 * c:4 * c].reshape(batch, c, *spatial),
+        )
+
+    def forward_with_postactivation(
+        self, x, index=0, output_shape=None, cond_embedding=None
+    ):
         if self.fno_skips is not None:
             x_skip_fno = self.fno_skips[index](x)
             x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
@@ -389,10 +481,24 @@ class FNOBlocks(nn.Module):
             else:
                 x = torch.tanh(x)
 
-        x_fno = self.convs[index](x, output_shape=output_shape)
+        # Thread the precomputed embedding to the conv only when mode
+        # modulation is active; legacy convs keep the (x, output_shape) call.
+        if self._mode_mod_enabled:
+            x_fno = self.convs[index](
+                x, output_shape=output_shape, mode_embedding=cond_embedding
+            )
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
+
+        scale1 = shift1 = scale2 = shift2 = None
+        if self._norm_mod_enabled:
+            scale1, shift1, scale2, shift2 = self._film_scale_shift(index, cond_embedding)
 
         if self.norm is not None:
             x_fno = self.norm[self.n_norms * index](x_fno)
+
+        if scale1 is not None:
+            x_fno = x_fno * (1 + scale1) + shift1
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
@@ -400,20 +506,26 @@ class FNOBlocks(nn.Module):
             x = self.non_linearity(x)
 
         if self.use_channel_mlp:
+            x_mlp = self.channel_mlp[index](x)
             if self.channel_mlp_skips is not None:
-                x = self.channel_mlp[index](x) + x_skip_channel_mlp
+                x = x_mlp + x_skip_channel_mlp
             else:
-                x = self.channel_mlp[index](x)
+                x = x_mlp
 
         if self.norm is not None:
             x = self.norm[self.n_norms * index + 1](x)
+
+        if scale2 is not None:
+            x = x * (1 + scale2) + shift2
 
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
 
         return x
 
-    def forward_with_preactivation(self, x, index=0, output_shape=None):
+    def forward_with_preactivation(
+        self, x, index=0, output_shape=None, cond_embedding=None
+    ):
         # Apply non-linear activation (and norm)
         # before this block's convolution/forward pass:
         x = self.non_linearity(x)
@@ -435,7 +547,12 @@ class FNOBlocks(nn.Module):
             else:
                 x = torch.tanh(x)
 
-        x_fno = self.convs[index](x, output_shape=output_shape)
+        if self._mode_mod_enabled:
+            x_fno = self.convs[index](
+                x, output_shape=output_shape, mode_embedding=cond_embedding
+            )
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
