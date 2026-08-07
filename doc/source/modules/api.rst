@@ -49,6 +49,24 @@ Tensorized FNO (TFNO)
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. _t_emb_fno_api:
+
+Time-conditioned FNO (t_emb_FNO)
+----------------------------------
+
+Time-conditioned variant of FNO. Accepts an optional scalar ``t`` in
+``forward`` and modulates spectral coefficients and/or normalization
+layers based on a learned embedding of ``(t, k)``.
+
+.. autosummary::
+    :toctree: generated
+    :template: class.rst
+
+    t_emb_FNO
+    t_emb_TFNO
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 .. _sfno_api:
 
 Spherical Fourier Neural Operators (SFNO)
@@ -59,6 +77,21 @@ Spherical Fourier Neural Operators (SFNO)
     :template: class.rst
 
     SFNO
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. _t_emb_sfno_api:
+
+Time-conditioned SFNO (t_emb_SFNO)
+------------------------------------
+
+Time-conditioned variant of SFNO. Requires ``torch-harmonics``.
+
+.. autosummary::
+    :toctree: generated
+    :template: class.rst
+
+    t_emb_SFNO
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

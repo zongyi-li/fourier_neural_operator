@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import nn
@@ -10,7 +10,6 @@ from .normalization_layers import AdaIN, InstanceNorm, BatchNorm
 from .skip_connections import skip_connection
 from .spectral_convolution import SpectralConv
 from ..utils import validate_scaling_factor
-
 
 Number = Union[int, float]
 
@@ -45,8 +44,8 @@ def _make_conv_bias(in_channels, out_channels, n_dim, kernel_size):
 
 class FNOBlocks(nn.Module):
     """FNOBlocks implements a sequence of Fourier layers.
-    
-    The Fourier layers are first described in [1]_, and the exact implementation details 
+
+    The Fourier layers are first described in [1]_, and the exact implementation details
     of the Fourier layer architecture are discussed in [2]_.
 
     Parameters
@@ -163,8 +162,12 @@ class FNOBlocks(nn.Module):
         conv_module=SpectralConv,
         fixed_rank_modes=False,
         implementation="factorized",
-        decomposition_kwargs=dict(),
+        decomposition_kwargs={},
         enforce_hermitian_symmetry=True,
+        embed: Optional[dict] = None,
+        mode_modulation: Optional[dict] = None,
+        norm_modulation: Optional[dict] = None,
+        n_params=1,
     ):
         super().__init__()
         if isinstance(n_modes, int):
@@ -172,9 +175,9 @@ class FNOBlocks(nn.Module):
         self._n_modes = n_modes
         self.n_dim = len(n_modes)
 
-        self.resolution_scaling_factor: Union[
-            None, List[List[float]]
-        ] = validate_scaling_factor(resolution_scaling_factor, self.n_dim, n_layers)
+        self.resolution_scaling_factor: Union[None, List[List[float]]] = (
+            validate_scaling_factor(resolution_scaling_factor, self.n_dim, n_layers)
+        )
 
         self.max_n_modes = max_n_modes
         self.fno_block_precision = fno_block_precision
@@ -201,10 +204,23 @@ class FNOBlocks(nn.Module):
         self.enforce_hermitian_symmetry = enforce_hermitian_symmetry
 
         # apply real nonlin if data is real, otherwise CGELU
-        if self.complex_data:
-            self.non_linearity = CGELU
-        else:
-            self.non_linearity = non_linearity
+        self.non_linearity = CGELU if self.complex_data else non_linearity
+        # Track which modulation pathways are active for the forward dispatch.
+        self._mode_mod_enabled = mode_modulation is not None and mode_modulation.get(
+            "enabled", True
+        )
+        self._norm_mod_enabled = norm_modulation is not None and norm_modulation.get(
+            "enabled", True
+        )
+
+        # Extra kwargs that only modulation-aware conv modules accept. We
+        # forward them only when modulation is requested, so legacy conv
+        # modules continue to work unchanged on the default path.
+        extra_modulation_kwargs = {}
+        if embed is not None or mode_modulation is not None:
+            extra_modulation_kwargs["embed"] = embed
+            extra_modulation_kwargs["mode_modulation"] = mode_modulation
+            extra_modulation_kwargs["n_params"] = n_params
 
         # One conv per layer. Only resolution_scaling_factor varies by layer index
         self.convs = nn.ModuleList(
@@ -234,6 +250,7 @@ class FNOBlocks(nn.Module):
                         if issubclass(conv_module, SpectralConv)
                         else {}
                     ),
+                    **extra_modulation_kwargs,
                 )
                 for i in range(n_layers)
             ]
@@ -281,7 +298,9 @@ class FNOBlocks(nn.Module):
                 [
                     ChannelMLP(
                         in_channels=self.out_channels,
-                        hidden_channels=round(self.out_channels * channel_mlp_expansion),
+                        hidden_channels=round(
+                            self.out_channels * channel_mlp_expansion
+                        ),
                         dropout=channel_mlp_dropout,
                         n_dim=self.n_dim,
                     )
@@ -351,6 +370,152 @@ class FNOBlocks(nn.Module):
         if self.complex_data and self.norm is not None:
             self.norm = nn.ModuleList([ComplexValued(x) for x in self.norm])
 
+        # Optional time-conditioning pathway. When both mode_modulation
+        # and norm_modulation are None (the default) the block behaves
+        # identically to its pre-modulation form and `t` is ignored.
+        if preactivation and self._norm_mod_enabled:
+            raise ValueError(
+                "norm_modulation is only supported with preactivation=False; "
+                "got preactivation=True."
+            )
+        self._build_time_embedding(embed, n_params=n_params)
+        self._build_norm_modulator(norm_modulation, n_layers)
+
+    def _build_time_embedding(self, embed: Optional[dict], n_params: int = 1) -> None:
+        if embed is None:
+            self.embed_config = None
+            return
+
+        # Copy so resolved defaults don't leak back into the caller's dict.
+        self.embed_config = dict(embed)
+
+        embed_dim = int(self.embed_config.get("dim", 32))
+        alpha = self.embed_config.get("alpha", -2.0)
+        r = self.embed_config.get("r", 10000.0)
+        type_t = self.embed_config.get("type_t", "sinusoidal")
+
+        self.embed_config["dim"] = embed_dim
+        self.embed_config["alpha"] = alpha
+        self.embed_config["r"] = r
+        self.embed_config["type_t"] = type_t
+        self.embed_dim = embed_dim
+        self.n_params = n_params
+
+        if type_t == "power":
+            self.register_buffer("t_powers", torch.linspace(alpha, 0.0, embed_dim))
+        elif type_t == "sinusoidal":
+            indices = torch.arange(0, embed_dim // 2, dtype=torch.float32)
+            self.register_buffer("t_inv_freqs", r ** (-2.0 * indices / embed_dim))
+        else:
+            raise ValueError(f"Unknown embed['type_t']: {type_t!r}")
+
+    def _build_norm_modulator(
+        self, norm_modulation: Optional[dict], n_layers: int
+    ) -> None:
+        self.norm_modulation_config = norm_modulation
+        self._mod_flags = {
+            "scale_shift_1": False,
+            "gate_1": False,
+            "scale_shift_2": False,
+            "gate_2": False,
+        }
+        self.norm_modulator = None
+        self._mod_slices = {}
+
+        if not self._norm_mod_enabled:
+            return
+
+        if self.embed_config is None:
+            raise ValueError(
+                "norm_modulation is enabled but `embed` is None. "
+                "Both must be provided to enable norm modulation."
+            )
+
+        modulate1 = bool(norm_modulation.get("modulate1", True))
+        modulate1_gate = bool(norm_modulation.get("modulate1_gate", True))
+        modulate2 = bool(norm_modulation.get("modulate2", True))
+        modulate2_gate = bool(norm_modulation.get("modulate2_gate", True))
+        hidden_channels = int(norm_modulation.get("hidden_channels", 64))
+
+        self._mod_flags = {
+            "scale_shift_1": modulate1,
+            "gate_1": modulate1_gate,
+            "scale_shift_2": modulate2,
+            "gate_2": modulate2_gate,
+        }
+
+        # Spec for the modulator MLP output: name, channel count, enabled flag.
+        specs = [
+            ("scale1", self.out_channels, modulate1),
+            ("shift1", self.out_channels, modulate1),
+            ("gate1", 1, modulate1_gate),
+            ("scale2", self.out_channels, modulate2),
+            ("shift2", self.out_channels, modulate2),
+            ("gate2", 1, modulate2_gate),
+        ]
+        offset = 0
+        for name, dim, enabled in specs:
+            if enabled:
+                self._mod_slices[name] = slice(offset, offset + dim)
+                offset += dim
+
+        total_out_dim = offset
+        if total_out_dim == 0:
+            return
+
+        self.norm_modulator = nn.ModuleList(
+            [
+                ChannelMLP(
+                    in_channels=self.n_params * self.embed_dim,
+                    out_channels=total_out_dim,
+                    hidden_channels=hidden_channels,
+                    n_dim=1,
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+    def _embed_t(self, t: torch.Tensor) -> torch.Tensor:
+        embed_type = self.embed_config["type_t"]
+        embeds = []
+        for p in range(self.n_params):
+            tp = t[:, p: p + 1]
+            if embed_type == "power":
+                if not torch.all(tp > 0):
+                    raise ValueError(
+                        "embed['type_t']='power' requires t > 0; "
+                        f"got t[:, {p}].min()={tp.min().item()}."
+                    )
+                tp_embed = tp ** self.t_powers.unsqueeze(0)
+            else:  # sinusoidal
+                tp_scaled = tp * self.t_inv_freqs.unsqueeze(0)
+                tp_embed = torch.cat(
+                    [torch.sin(tp_scaled), torch.cos(tp_scaled)], dim=-1
+                )
+            embeds.append(tp_embed)
+
+        t_embed = torch.cat(embeds, dim=-1)  # (B, P*embed_dim)
+        return t_embed.unsqueeze(-1)  # (B, P*embed_dim, 1)
+
+    def _get_modulation_params(self, t: torch.Tensor, layer_idx: int) -> dict:
+        """Return AdaIN scale/shift and gate params for the given layer.
+
+        Each value is shaped ``(B, dim, 1, 1, ...)`` with ``self.n_dim``
+        trailing singleton dims so it broadcasts over spatial axes.
+        Disabled specs are absent from the returned dict.
+        """
+        if self.norm_modulator is None:
+            return {}
+        t_feature = self._embed_t(t)
+        raw = self.norm_modulator[layer_idx](t_feature)
+
+        spatial = (1,) * self.n_dim
+        params = {}
+        for name, sl in self._mod_slices.items():
+            v = raw[:, sl]
+            params[name] = v.reshape(v.shape[0], v.shape[1], *spatial)
+        return params
+
     def set_ada_in_embeddings(self, *embeddings):
         """Sets the embeddings of each Ada-IN norm layers
 
@@ -368,31 +533,44 @@ class FNOBlocks(nn.Module):
                 for norm, embedding in zip(self.norm, embeddings):
                     norm.set_embedding(embedding)
 
-    def forward(self, x, index=0, output_shape=None):
+    def forward(self, x, index=0, output_shape=None, t=None):
         if self.preactivation:
-            return self.forward_with_preactivation(x, index, output_shape)
+            return self.forward_with_preactivation(x, index, output_shape, t=t)
         else:
-            return self.forward_with_postactivation(x, index, output_shape)
+            return self.forward_with_postactivation(x, index, output_shape, t=t)
 
-    def forward_with_postactivation(self, x, index=0, output_shape=None):
+    def forward_with_postactivation(self, x, index=0, output_shape=None, t=None):
         if self.fno_skips is not None:
             x_skip_fno = self.fno_skips[index](x)
-            x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
+            x_skip_fno = self.convs[index].transform(
+                x_skip_fno, output_shape=output_shape
+            )
 
         if self.use_channel_mlp and self.channel_mlp_skips is not None:
             x_skip_channel_mlp = self.channel_mlp_skips[index](x)
-            x_skip_channel_mlp = self.convs[index].transform(x_skip_channel_mlp, output_shape=output_shape)
+            x_skip_channel_mlp = self.convs[index].transform(
+                x_skip_channel_mlp, output_shape=output_shape
+            )
 
         if self.stabilizer == "tanh":
-            if self.complex_data:
-                x = ctanh(x)
-            else:
-                x = torch.tanh(x)
-
-        x_fno = self.convs[index](x, output_shape=output_shape)
+            x = ctanh(x) if self.complex_data else torch.tanh(x)
+        # The conv accepts `t` only when mode_modulation was configured at
+        # construction time; pass it positionally so SpectralConv-family
+        # signatures (x, t, output_shape) work uniformly.
+        if self._mode_mod_enabled:
+            x_fno = self.convs[index](x, t, output_shape=output_shape)
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
 
         if self.norm is not None:
             x_fno = self.norm[self.n_norms * index](x_fno)
+
+        mods = self._get_modulation_params(t, index) if self._norm_mod_enabled else {}
+
+        if self._mod_flags["scale_shift_1"]:
+            x_fno = x_fno * (1 + mods["scale1"]) + mods["shift1"]
+        if self._mod_flags["gate_1"]:
+            x_fno = x_fno * torch.sigmoid(mods["gate1"])
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
@@ -400,22 +578,24 @@ class FNOBlocks(nn.Module):
             x = self.non_linearity(x)
 
         if self.use_channel_mlp:
-            if self.channel_mlp_skips is not None:
-                x = self.channel_mlp[index](x) + x_skip_channel_mlp
-            else:
-                x = self.channel_mlp[index](x)
-
+            x_mlp = self.channel_mlp[index](x)
+            if self._mod_flags["gate_2"]:
+                x_mlp = x_mlp * torch.sigmoid(mods["gate2"])
+            x = x_mlp + x_skip_channel_mlp if self.channel_mlp_skips is not None else x_mlp
         if self.norm is not None:
             x = self.norm[self.n_norms * index + 1](x)
+
+        if self._mod_flags["scale_shift_2"]:
+            x = x * (1 + mods["scale2"]) + mods["shift2"]
 
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
 
         return x
 
-    def forward_with_preactivation(self, x, index=0, output_shape=None):
-        # Apply non-linear activation (and norm)
-        # before this block's convolution/forward pass:
+    def forward_with_preactivation(self, x, index=0, output_shape=None, t=None):
+        # norm_modulation is disallowed in this path (validated in __init__);
+        # `t` is only threaded to the conv when mode_modulation is configured.
         x = self.non_linearity(x)
 
         if self.norm is not None:
@@ -423,19 +603,22 @@ class FNOBlocks(nn.Module):
 
         if self.fno_skips is not None:
             x_skip_fno = self.fno_skips[index](x)
-            x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
+            x_skip_fno = self.convs[index].transform(
+                x_skip_fno, output_shape=output_shape
+            )
 
         if self.use_channel_mlp and self.channel_mlp_skips is not None:
             x_skip_channel_mlp = self.channel_mlp_skips[index](x)
-            x_skip_channel_mlp = self.convs[index].transform(x_skip_channel_mlp, output_shape=output_shape)
+            x_skip_channel_mlp = self.convs[index].transform(
+                x_skip_channel_mlp, output_shape=output_shape
+            )
 
         if self.stabilizer == "tanh":
-            if self.complex_data:
-                x = ctanh(x)
-            else:
-                x = torch.tanh(x)
-
-        x_fno = self.convs[index](x, output_shape=output_shape)
+            x = ctanh(x) if self.complex_data else torch.tanh(x)
+        if self._mode_mod_enabled:
+            x_fno = self.convs[index](x, t, output_shape=output_shape)
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 

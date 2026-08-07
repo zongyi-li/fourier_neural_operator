@@ -225,6 +225,248 @@ def test_FNOBlock_skip_connections_preactivation(fno_skip, channel_mlp_skip):
     assert res.shape == (2, 4, *size)
 
 
+# ----------------------------------------------------------------------
+# Optional time-conditioning pathway
+# ----------------------------------------------------------------------
+
+
+def _embed(dim=8):
+    return {
+        "type_t": "sinusoidal",
+        "type_k": "power",
+        "dim": dim,
+        "alpha": -2.0,
+        "r": 10000.0,
+    }
+
+
+def _mode_mod(mod_type="real"):
+    return {"enabled": True, "type": mod_type, "hidden_channels": 16, "full_res": False}
+
+
+def _norm_mod(modulate1=True, modulate1_gate=True, modulate2=True, modulate2_gate=True):
+    return {
+        "enabled": True,
+        "hidden_channels": 16,
+        "modulate1": modulate1,
+        "modulate1_gate": modulate1_gate,
+        "modulate2": modulate2,
+        "modulate2_gate": modulate2_gate,
+    }
+
+
+@pytest.mark.parametrize("norm", [None, "group_norm", "instance_norm"])
+def test_block_default_ignores_t(norm):
+    """A FNOBlocks built without modulation dicts ignores `t`."""
+    torch.manual_seed(0)
+    block = FNOBlocks(2, 2, (6, 6), n_layers=2, norm=norm)
+    assert block.norm_modulator is None
+    assert not block._mode_mod_enabled
+    assert not block._norm_mod_enabled
+    x = torch.randn(2, 2, 10, 10)
+    y_no_t = block(x, index=0)
+    y_with_t = block(x, index=0, t=torch.zeros(2, 1))
+    torch.testing.assert_close(y_no_t, y_with_t)
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_mode_modulation_only_forward(mod_type):
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=2,
+        norm="group_norm",
+        embed=_embed(),
+        mode_modulation=_mode_mod(mod_type),
+    )
+    x = torch.randn(2, 2, 10, 10)
+    t = torch.tensor([[0.5], [1.5]])
+    y = block(x, index=0, t=t)
+    assert y.shape == (2, 2, 10, 10)
+    assert torch.isfinite(y).all()
+
+
+def test_block_mode_modulation_requires_t():
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=2,
+        embed=_embed(),
+        mode_modulation=_mode_mod("real"),
+    )
+    with pytest.raises(ValueError, match="t"):
+        block(torch.randn(2, 2, 10, 10), index=0)
+
+
+@pytest.mark.parametrize("modulate1", [True, False])
+@pytest.mark.parametrize("modulate1_gate", [True, False])
+@pytest.mark.parametrize("modulate2", [True, False])
+@pytest.mark.parametrize("modulate2_gate", [True, False])
+def test_block_norm_modulation_flags(
+    modulate1, modulate1_gate, modulate2, modulate2_gate
+):
+    if not (modulate1 or modulate1_gate or modulate2 or modulate2_gate):
+        pytest.skip("All flags off → norm_modulator is None; covered elsewhere")
+
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=1,
+        norm="group_norm",
+        embed=_embed(),
+        norm_modulation=_norm_mod(
+            modulate1=modulate1,
+            modulate1_gate=modulate1_gate,
+            modulate2=modulate2,
+            modulate2_gate=modulate2_gate,
+        ),
+    )
+    x = torch.randn(2, 2, 10, 10)
+    t = torch.tensor([[0.5], [1.5]])
+    y = block(x, index=0, t=t)
+    assert y.shape == (2, 2, 10, 10)
+    assert torch.isfinite(y).all()
+
+
+def test_block_norm_modulation_all_flags_off_inert():
+    """All four flags off should leave norm_modulator=None."""
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=1,
+        norm="group_norm",
+        embed=_embed(),
+        norm_modulation=_norm_mod(
+            modulate1=False,
+            modulate1_gate=False,
+            modulate2=False,
+            modulate2_gate=False,
+        ),
+    )
+    assert block.norm_modulator is None
+
+
+def test_block_modulator_sized_by_enabled_specs():
+    """A flag set to False omits its slot from the modulator MLP output."""
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=1,
+        norm="group_norm",
+        embed=_embed(),
+        norm_modulation=_norm_mod(
+            modulate1=True,
+            modulate1_gate=False,
+            modulate2=False,
+            modulate2_gate=False,
+        ),
+    )
+    # only scale1+shift1 should be in the output: out_channels * 2
+    assert block.norm_modulator[0].out_channels == block.out_channels * 2
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_both_modulations_forward(mod_type):
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=2,
+        norm="group_norm",
+        embed=_embed(),
+        mode_modulation=_mode_mod(mod_type),
+        norm_modulation=_norm_mod(),
+    )
+    x = torch.randn(2, 2, 10, 10)
+    t = torch.tensor([[0.5], [1.5]])
+    y = block(x, index=0, t=t)
+    assert y.shape == (2, 2, 10, 10)
+    assert torch.isfinite(y).all()
+
+
+@pytest.mark.parametrize("mod_type", ["real", "complex", "polar"])
+def test_block_both_modulations_backward(mod_type):
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=1,
+        norm="group_norm",
+        embed=_embed(),
+        mode_modulation=_mode_mod(mod_type),
+        norm_modulation=_norm_mod(),
+    )
+    x = torch.randn(2, 2, 10, 10, requires_grad=True)
+    t = torch.tensor([[0.5], [1.5]])
+    y = block(x, index=0, t=t)
+    y.sum().backward()
+    assert x.grad is not None
+    for name, param in block.named_parameters():
+        assert param.grad is not None, f"no grad for {name}"
+
+
+@pytest.mark.parametrize(
+    "t_factory",
+    [
+        lambda B: torch.tensor(0.5),
+        lambda B: torch.full((B, 1), 0.5),
+    ],
+)
+def test_block_t_broadcast_shapes(t_factory):
+    torch.manual_seed(0)
+    block = FNOBlocks(
+        2,
+        2,
+        (6, 6),
+        n_layers=1,
+        norm="group_norm",
+        embed=_embed(),
+        mode_modulation=_mode_mod("real"),
+        norm_modulation=_norm_mod(),
+    )
+    B = 2
+    x = torch.randn(B, 2, 10, 10)
+    t = t_factory(B)
+    if t.ndim == 0:
+        t = t.expand(B, 1)
+    y = block(x, index=0, t=t)
+    assert y.shape == (B, 2, 10, 10)
+
+
+def test_block_norm_modulation_without_embed_raises():
+    with pytest.raises(ValueError, match="embed"):
+        FNOBlocks(
+            2,
+            2,
+            (6, 6),
+            n_layers=1,
+            norm="group_norm",
+            embed=None,
+            norm_modulation=_norm_mod(),
+        )
+
+
+def test_block_preactivation_with_norm_modulation_raises():
+    with pytest.raises(ValueError, match="preactivation"):
+        FNOBlocks(
+            2,
+            2,
+            (6, 6),
+            n_layers=1,
+            norm="group_norm",
+            preactivation=True,
+            embed=_embed(),
+            norm_modulation=_norm_mod(),
+        )
 @pytest.mark.parametrize("n_dim", [1, 2, 3])
 def test_FNOBlock_conv_bias_kernel(n_dim):
     """Test local convolutional bias kernels beside spectral convolution."""
