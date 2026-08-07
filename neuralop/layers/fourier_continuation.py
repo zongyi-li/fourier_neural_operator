@@ -316,8 +316,8 @@ class FCGram(FourierContinuation):
     Fourier Continuation of discretized functions.
 
     If the required pre-computed FCGram matrices are not available, they
-    can be computed using the MATLAB code from the FCGram repository
-    https://github.com/neuraloperator/FCGram/
+    can be computed using the MATLAB code from the FC_PINO repository
+    https://github.com/neuraloperator/FC_PINO/tree/main/FC_Gram_Construction
     and then saved to the appropriate matrices_path directory in .npz format.
 
     The matrices are:
@@ -431,8 +431,8 @@ class FCGram(FourierContinuation):
         Note
         ----
         If the required matrices are not available, they can be computed using the
-        MATLAB code from the FCGram repository:
-        https://github.com/neuraloperator/FCGram/
+        MATLAB code from the FC_PINO repository:
+        https://github.com/neuraloperator/FC_PINO/tree/main/FC_Gram_Construction
 
         The computed matrices should be saved in .npz format in the matrices_path
         directory with the correct naming convention.
