@@ -69,7 +69,7 @@ class CarCFDDataset(MeshDataModule):
         self.zenodo_record_id = "13936501"
 
         if isinstance(root_dir, str):
-            root_dir = Path(root_dir)
+            root_dir = Path(root_dir).expanduser()
 
         if not root_dir.exists():
             root_dir.mkdir(parents=True)
@@ -77,7 +77,7 @@ class CarCFDDataset(MeshDataModule):
         if download:
             download_from_zenodo_record(record_id=self.zenodo_record_id, root=root_dir)
         super().__init__(
-            root_dir=root_dir,
+            root_dir=root_dir / "processed-car-pressure-data",
             item_dir_name="data/",
             n_train=n_train,
             n_test=n_test,

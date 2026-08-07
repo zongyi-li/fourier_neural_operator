@@ -70,7 +70,7 @@ data_module = CarCFDDataset(
     query_res=[config.data.sdf_query_resolution] * 3,
     n_train=config.data.n_train,
     n_test=config.data.n_test,
-    download=True,
+    download=config.data.download,
 )
 
 # Create data loaders

@@ -146,6 +146,7 @@ trainer.train(
     scheduler=scheduler,
     regularizer=False,
     training_loss=train_loss,
+    eval_losses=eval_losses,
     save_every=1,
     save_dir="./checkpoints",
 )
@@ -172,5 +173,6 @@ trainer.train(
     scheduler=scheduler,
     regularizer=False,
     training_loss=train_loss,
+    eval_losses=eval_losses,
     resume_from_dir="./checkpoints",
 )

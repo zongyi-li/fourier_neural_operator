@@ -8,7 +8,7 @@ from .wandb import WandbConfig
 
 
 class CarCFDDatasetConfig(ConfigBase):
-    root: str = "~/data/car-pressure-data/processed-car-pressure-data"
+    root: str = "~/data/car-pressure-data/"
     sdf_query_resolution: int = 32
     n_train: int = 500
     n_test: int = 111

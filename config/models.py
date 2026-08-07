@@ -113,7 +113,7 @@ class FNOGNOConfig(ModelConfig):
     data_channels: int
     out_channels: int
     gno_coord_dim: int
-    gno_coord_embed_dim: int
+    gno_embed_channels: int
     gno_radius: float
     gno_transform_type: str
     fno_n_modes: List[int]
@@ -133,7 +133,7 @@ class FNOGNO_Small3d(FNOGNOConfig):
     data_channels: int = 1
     out_channels: int = 1
     gno_coord_dim: int = 3
-    gno_coord_embed_dim: int = 16
+    gno_embed_channels: int = 16
     gno_radius: float = 0.033
     gno_transform_type: str = "linear"
     fno_n_modes: List[int] = [16, 16, 16]
@@ -149,7 +149,7 @@ class GINOConfig(ModelConfig):
     out_channels: int
     latent_feature_channels: Optional[int] = None
     gno_coord_dim: int = 3
-    gno_coord_embed_dim: int = 16
+    gno_embed_channels: int = 16
     gno_radius: float = 0.033
     in_gno_transform_type: str = "linear"
     out_gno_transform_type: str = "linear"
@@ -173,7 +173,7 @@ class GINO_Small3d(GINOConfig):
     out_channels: int = 1
     latent_feature_channels: Optional[int] = 1
     gno_coord_dim: int = 3
-    gno_coord_embed_dim: int = 16
+    gno_embed_channels: int = 16
     gno_radius: float = 0.033
 
 

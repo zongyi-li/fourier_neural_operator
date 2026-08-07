@@ -37,7 +37,8 @@ fno_ada_in_features = 4
 )
 @pytest.mark.parametrize("latent_feature_dim", [None, 2])
 @pytest.mark.parametrize("use_torch_scatter", use_torch_scatter)
-def test_gino(gno_transform_type, latent_feature_dim, gno_coord_dim, gno_pos_embed_type, batch_size, use_torch_scatter):
+@pytest.mark.parametrize("fno_domain_padding", [None, 0.125])
+def test_gino(gno_transform_type, latent_feature_dim, gno_coord_dim, gno_pos_embed_type, batch_size, use_torch_scatter, fno_domain_padding):
     if torch.backends.cuda.is_built():
         device = torch.device("cuda:0")
     else:
@@ -63,6 +64,7 @@ def test_gino(gno_transform_type, latent_feature_dim, gno_coord_dim, gno_pos_emb
         fno_ada_in_features=fno_ada_in_features,
         # keep the FNO model small for runtime
         fno_lifting_channel_ratio=lifting_channels,
+        fno_domain_padding=fno_domain_padding,
     ).to(device)
 
     # create grid of latent queries on the unit cube

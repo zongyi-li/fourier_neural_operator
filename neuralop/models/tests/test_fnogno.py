@@ -24,7 +24,8 @@ except:
 @pytest.mark.parametrize("gno_pos_embed_type", [None, "transformer"])
 @pytest.mark.parametrize("fno_norm", [None, "ada_in"])
 @pytest.mark.parametrize("use_torch_scatter", use_torch_scatter)
-def test_fnogno(gno_transform_type, fno_n_modes, gno_batched, gno_pos_embed_type, fno_norm, use_torch_scatter):
+@pytest.mark.parametrize("fno_domain_padding", [None, 0.125])
+def test_fnogno(gno_transform_type, fno_n_modes, gno_batched, gno_pos_embed_type, fno_norm, use_torch_scatter, fno_domain_padding):
     if torch.has_cuda:
         device = torch.device("cuda:0")
     else:
@@ -48,6 +49,7 @@ def test_fnogno(gno_transform_type, fno_n_modes, gno_batched, gno_pos_embed_type
         fno_ada_in_features=4,
         gno_use_open3d=False,
         gno_use_torch_scatter=use_torch_scatter,
+        fno_domain_padding=fno_domain_padding,
     ).to(device)
 
     in_p_shape = [

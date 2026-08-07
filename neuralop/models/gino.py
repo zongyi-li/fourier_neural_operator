@@ -13,6 +13,7 @@ from .base_model import BaseModel
 
 from ..layers.channel_mlp import ChannelMLP
 from ..layers.embeddings import SinusoidalEmbedding
+from ..layers.padding import DomainPadding
 from ..layers.fno_block import FNOBlocks
 from ..layers.spectral_convolution import SpectralConv
 from ..layers.gno_block import GNOBlock
@@ -149,6 +150,8 @@ class GINO(BaseModel):
         Options: "reconstructed", "factorized". Default: "factorized"
     fno_decomposition_kwargs : dict, optional
         Additional parameters to pass to the tensor decomposition. Default: {}
+    fno_domain_padding : float | None, defaults to None
+            If not None, percentage of padding to use.
     fno_conv_module : nn.Module, optional
         Spectral convolution module to use. Default: SpectralConv
     fno_enforce_hermitian_symmetry : bool, optional
@@ -218,6 +221,7 @@ class GINO(BaseModel):
         fno_fixed_rank_modes=False,
         fno_implementation="factorized",
         fno_decomposition_kwargs=dict(),
+        fno_domain_padding=None,
         fno_conv_module=SpectralConv,
         fno_enforce_hermitian_symmetry=True,
     ):
@@ -318,6 +322,17 @@ class GINO(BaseModel):
             n_layers=2,
         )  # CHANGED RECENTLY FOR THIS PAPER
 
+        # Domain padding
+        if fno_domain_padding is not None and (
+            (isinstance(fno_domain_padding, list) and sum(fno_domain_padding) > 0)
+            or (isinstance(fno_domain_padding, (float, int)) and fno_domain_padding > 0)
+        ):
+            self.domain_padding = DomainPadding(
+                domain_padding=fno_domain_padding
+            )
+        else:
+            self.domain_padding = None
+
         ### FNOBlocks in latent space
         # input: `in_p` intermediate embeddings,
         # possibly concatenated feature channels `latent_features`
@@ -405,9 +420,14 @@ class GINO(BaseModel):
 
         # Apply FNO blocks
         in_p = self.lifting(in_p)
+        if self.domain_padding is not None:
+            in_p = self.domain_padding.pad(in_p)
 
         for idx in range(self.fno_blocks.n_layers):
             in_p = self.fno_blocks(in_p, idx)
+
+        if self.domain_padding is not None:
+            in_p = self.domain_padding.unpad(in_p)
 
         return in_p
 
