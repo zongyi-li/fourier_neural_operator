@@ -1,5 +1,5 @@
 from functools import partialmethod
-from typing import Tuple, List, Union, Literal
+from typing import Optional, Tuple, List, Union, Literal
 
 Number = Union[float, int]
 
@@ -43,6 +43,9 @@ class FNO(BaseModel, name="FNO"):
         Number of channels in input function. Determined by the problem.
     out_channels : int
         Number of channels in output function. Determined by the problem.
+        When ``readout`` is set, this becomes the intermediate channel width
+        feeding the readout head; the model's actual output shape is then
+        ``(batch, readout.out_dim)`` rather than ``(batch, out_channels, *spatial)``.
     hidden_channels : int
         Width of the FNO (i.e. number of channels).
         This significantly affects the number of parameters of the FNO.
@@ -148,6 +151,10 @@ class FNO(BaseModel, name="FNO"):
         frequency and Nyquist frequency are real-valued before calling irfft. When False,
         relies on cuFFT's irfftn to handle symmetry automatically, which may fail on
         certain GPUs or input sizes, causing line artifacts. By default True.
+    readout : nn.Module, optional
+        Optional module applied after the projection layer to map field outputs
+        of shape ``(B, C, *spatial)`` to task-specific outputs (e.g., scalar or
+        vector quantities of interest). If ``None``, returns the projected field.
 
     Examples
     --------
@@ -190,7 +197,9 @@ class FNO(BaseModel, name="FNO"):
         use_channel_mlp: bool = True,
         channel_mlp_dropout: float = 0,
         channel_mlp_expansion: float = 0.5,
-        channel_mlp_skip: Literal["linear", "identity", "soft-gating", None] = "soft-gating",
+        channel_mlp_skip: Literal[
+            "linear", "identity", "soft-gating", None
+        ] = "soft-gating",
         fno_skip: Literal["linear", "identity", "soft-gating", None] = "linear",
         conv_bias_kernel: int = 1,
         resolution_scaling_factor: Union[Number, List[Number]] = None,
@@ -207,9 +216,27 @@ class FNO(BaseModel, name="FNO"):
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
+        readout: Optional[nn.Module] = None,
     ):
         if decomposition_kwargs is None:
             decomposition_kwargs = {}
+        if complex_data and readout is not None:
+            raise ValueError(
+                "readout is not supported with complex_data=True. "
+                "The projection layer outputs a complex tensor, so the readout "
+                "would need to collapse it to real values — but the right approach "
+                "depends on your use case. Wrap your input or the projection output "
+                "explicitly before passing to a readout, for example: "
+                "x.real (real part only), x.abs() (modulus field then pool), or "
+                "x.mean(spatial_dims).abs() (pool then take modulus)."
+            )
+        if readout is not None and hasattr(readout, "in_channels"):
+            if readout.in_channels != out_channels:
+                raise ValueError(
+                    f"readout.in_channels ({readout.in_channels}) must match "
+                    f"out_channels ({out_channels}). The readout is applied after "
+                    "the projection layer, which outputs out_channels channels."
+                )
         super().__init__()
         self.n_dim = len(n_modes)
 
@@ -242,6 +269,7 @@ class FNO(BaseModel, name="FNO"):
         self.preactivation = preactivation
         self.complex_data = complex_data
         self.fno_block_precision = fno_block_precision
+        self.readout = readout
 
         ## Positional embedding
         if positional_embedding == "grid":
@@ -360,6 +388,14 @@ class FNO(BaseModel, name="FNO"):
 
         6. Projection of intermediate function representation to the output channels
 
+        7. If ``readout`` is set, applies the readout module to map the field
+           ``(B, out_channels, *spatial)`` to task-specific output (e.g. a scalar
+           or vector quantity of interest).  The output shape and meaning change
+           accordingly.  Note that ``output_shape`` (step 4) changes the spatial
+           resolution of the field that enters the readout without changing the
+           physical domain, so ``measure_per_dim`` should always reflect the
+           physical extent of the domain.
+
         Parameters
         ----------
         x : tensor
@@ -403,6 +439,10 @@ class FNO(BaseModel, name="FNO"):
             x = self.domain_padding.unpad(x)
 
         x = self.projection(x)
+
+        # The readout consumes the projected field, so its input width matches out_channels.
+        if self.readout is not None:
+            x = self.readout(x)
 
         return x
 

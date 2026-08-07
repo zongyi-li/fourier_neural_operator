@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from ..otno import OTNO
+from ..readouts import ResolutionInvariantReadout
 
 # Fixed variables
 in_channels = 9
@@ -106,6 +107,25 @@ def test_otno_output_shape(n_s_sqrt, n_target_points):
 
     assert list(out.shape) == [batch_size, n_target_points]
     assert out.isfinite().all()
+
+
+def test_otno_rejects_readout():
+    """OTNO should raise ValueError when readout is passed.
+
+    OTNO.forward removes the batch dimension and indexes into a target mesh
+    before projection, so its output is incompatible with readout heads that
+    expect (B, C, *spatial) input.  Silently accepting readout would let users
+    think they are getting a scalar/vector QoI head when the head is never called.
+    """
+    with pytest.raises(ValueError, match="readout"):
+        OTNO(
+            n_modes=[8, 8],
+            hidden_channels=8,
+            in_channels=4,
+            out_channels=1,
+            n_layers=2,
+            readout=ResolutionInvariantReadout(in_channels=1, out_dim=3),
+        )
 
 
 def test_otno_group_norm():

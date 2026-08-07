@@ -46,6 +46,13 @@ class OTNO(FNO):
         domain_padding=None,
         **kwargs,
     ):
+        if kwargs.get("readout") is not None:
+            raise ValueError(
+                "readout is not supported by OTNO. OTNO.forward indexes into a "
+                "target mesh and returns output of shape (out_channels, n_target), "
+                "which is incompatible with ResolutionInvariantReadout "
+                "and similar heads that expect (B, C, *spatial) input."
+            )
         super().__init__(
             n_modes=n_modes,
             hidden_channels=hidden_channels,
