@@ -149,11 +149,13 @@ class GINOConfig(ModelConfig):
     out_channels: int
     latent_feature_channels: Optional[int] = None
     gno_coord_dim: int = 3
-    gno_coord_embed_dim: int = 16
-    gno_radius: float = 0.033
+    gno_embed_channels: int = 16
+    in_gno_radius: float = 0.033
+    out_gno_radius: float = 0.033
     in_gno_transform_type: str = "linear"
     out_gno_transform_type: str = "linear"
-    gno_pos_embed_type: str = "nerf"
+    in_gno_pos_embed_type: str = "nerf"
+    out_gno_pos_embed_type: str = "nerf"
     gno_weighting_function: Optional[str] = None
     gno_weight_function_scale: Optional[float] = None
     fno_n_modes: List[int] = [16, 16, 16]
@@ -163,7 +165,6 @@ class GINOConfig(ModelConfig):
     fno_ada_in_features: int = 32
     fno_factorization: str = "tucker"
     fno_rank: float = 0.4
-    fno_domain_padding: float = 0.125
     fno_channel_mlp_expansion: float = 1.0
     fno_resolution_scaling_factor: int = 1
 
@@ -173,8 +174,9 @@ class GINO_Small3d(GINOConfig):
     out_channels: int = 1
     latent_feature_channels: Optional[int] = 1
     gno_coord_dim: int = 3
-    gno_coord_embed_dim: int = 16
-    gno_radius: float = 0.033
+    gno_embed_channels: int = 16
+    in_gno_radius: float = 0.033
+    out_gno_radius: float = 0.033
 
 
 class GINO_Poisson2d(GINOConfig):
@@ -209,7 +211,6 @@ class GINO_Poisson2d(GINOConfig):
     fno_ada_in_features: int = 8
     fno_factorization: Optional[Any] = None
     fno_rank: float = 0.8
-    fno_domain_padding: float = 0.0
 
 
 class OTNOConfig(ModelConfig):
