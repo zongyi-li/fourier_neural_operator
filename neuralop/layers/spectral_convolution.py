@@ -9,6 +9,7 @@ import tensorly as tl
 from tensorly.plugins import use_opt_einsum
 from tltorch.factorized_tensors.core import FactorizedTensor
 
+from .channel_mlp import ChannelMLP
 from .einsum_utils import einsum_complexhalf
 from .base_spectral_conv import BaseSpectralConv
 from .resample import resample
@@ -414,18 +415,40 @@ class SpectralConv(BaseSpectralConv):
             n_modes[-1] = n_modes[-1] // 2 + 1
         self._n_modes = n_modes
 
-    def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None):
-        """Generic forward pass for the Factorized Spectral Conv
+
+    def _modulate_modes(self, x_hat, modes, condition_embedding=None):
+        """Hook called on the kept spectral modes before the weight contraction.
+        The base implementation does nothing. Override in a subclass to apply
+        per-mode conditioning.
+        
+        See ConditionalSpectralConv)
 
         Parameters
         ----------
-        x : torch.Tensor
-            input activation of size (batch_size, channels, d1, ..., dN)
+        x_hat : torch.Tensor
+            Kept Fourier modes, shape (B, in_channels, *modes_shape).
+        modes: tuple of int
+            Shape of the kept-mode grid (same as x_hat.shape[2:]).
+        condition_embedding: torch.Tensor or None
+            Per-sample conditioning vector, shape (B, D).
 
         Returns
         -------
-        tensorized_spectral_conv(x)
+        torch.Tensor
+            Modulated modes, same shape as x_hat.
         """
+        return x_hat
+
+    def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None):
+        return self._forward_impl(x, output_shape=output_shape)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        output_shape: Optional[Tuple[int]] = None,
+        condition_embedding: Optional[torch.Tensor] = None,
+    ):
+        """Shared implementation used by forward and ConditionalSpectralConv.forward."""
         batchsize, channels, *mode_sizes = x.shape
 
         fft_size = list(mode_sizes)
