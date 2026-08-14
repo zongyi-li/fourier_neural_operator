@@ -113,3 +113,44 @@ def test_SpectralConv2(enforce_hermitian_symmetry, dim, spatial_size, modes, res
     assert res.shape == (2, 4, *out_size)
     assert res.dtype == torch.float32
     assert not torch.is_complex(res)
+
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+def test_SpectralConv_complex_output_shape_and_dtype(dim):
+    conv = SpectralConv(
+        2,
+        4,
+        (4,) * dim,
+        complex_data=True,
+        factorization=None,
+    )
+    x = torch.randn(3, 2, *((8,) * dim), dtype=torch.cfloat)
+
+    y = conv(x)
+
+    assert y.shape == (3, 4, *((8,) * dim))
+    assert y.dtype == torch.cfloat
+    assert torch.is_complex(y)
+
+
+def test_SpectralConv_complex_centers_last_fft_dimension():
+    size = 8
+    conv = SpectralConv(
+        1,
+        1,
+        (3, 3),
+        complex_data=True,
+        factorization=None,
+        bias=False,
+    )
+    with torch.no_grad():
+        conv.weight.tensor.zero_()
+        conv.weight.tensor[0, 0, 1, 0] = 1
+
+    coordinates = torch.arange(size)
+    signal = torch.exp(-2j * torch.pi * coordinates / size)
+    x = signal.reshape(1, 1, 1, size).expand(1, 1, size, size)
+
+    y = conv(x)
+
+    torch.testing.assert_close(y, x)

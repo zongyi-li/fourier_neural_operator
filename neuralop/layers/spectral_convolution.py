@@ -445,7 +445,7 @@ class SpectralConv(BaseSpectralConv):
             # See :ref:`fft_shift_explanation` for discussion of the FFT shift.
             dims_to_fft_shift = fft_dims[:-1]
 
-        if self.order > 1:
+        if dims_to_fft_shift:
             x = torch.fft.fftshift(x, dim=dims_to_fft_shift)
 
         if self.fno_block_precision == "mixed":
@@ -511,9 +511,9 @@ class SpectralConv(BaseSpectralConv):
             # this slice represents the desired indices along each dim
             slices_x += [slice(center - negative_freqs, center + positive_freqs)]
 
-        if weight.shape[-1] < fft_size[-1]:
+        if not self.complex_data and weight.shape[-1] < fft_size[-1]:
             slices_x[-1] = slice(None, weight.shape[-1])
-        else:
+        elif not self.complex_data:
             slices_x[-1] = slice(None)
 
         slices_x = tuple(slices_x)
@@ -528,8 +528,8 @@ class SpectralConv(BaseSpectralConv):
             mode_sizes = output_shape
 
 
-        if self.order > 1:
-            out_fft = torch.fft.ifftshift(out_fft, dim=fft_dims[:-1])
+        if dims_to_fft_shift:
+            out_fft = torch.fft.ifftshift(out_fft, dim=dims_to_fft_shift)
         
 
         # Inverse FFT 
@@ -544,7 +544,7 @@ class SpectralConv(BaseSpectralConv):
             # To fix this, we split the ifftn into a ifftn in (n-1) dimensions and a irfft in the last dimension,
             # although it incurs a small additional computational cost.
             
-            if self.enforce_hermitian_symmetry:
+            if self.enforce_hermitian_symmetry and self.order > 1:
                 out_fft = torch.fft.ifftn(out_fft, s=mode_sizes[:-1], dim=fft_dims[:-1], norm=self.fft_norm)
                 
                 # Enforce Hermitian symmetry conditions for irfft
