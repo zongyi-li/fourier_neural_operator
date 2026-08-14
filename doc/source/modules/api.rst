@@ -516,6 +516,29 @@ training a machine learning model to minimize a loss function on a dataset:
 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Optimizers
+----------
+
+.. automodule:: neuralop.training.tensorgrad
+    :no-members:
+    :no-inherited-members:
+
+.. autosummary::
+    :toctree: generated
+    :template: class.rst
+
+    TensorGRaD
+    TensorGRaDProjector
+    UnstructuredSparseProjector
+
+.. autosummary::
+    :toctree: generated
+    :template: function.rst
+
+    fno_tensorgrad_param_groups
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Training Utilities
 ------------------
 
