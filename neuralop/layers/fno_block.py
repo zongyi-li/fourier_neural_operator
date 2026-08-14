@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import nn
@@ -8,7 +8,7 @@ from .channel_mlp import ChannelMLP
 from .complex import CGELU, ctanh, ComplexValued
 from .normalization_layers import AdaIN, InstanceNorm, BatchNorm
 from .skip_connections import skip_connection
-from .spectral_convolution import SpectralConv
+from .spectral_convolution import SpectralConv, ConditionalSpectralConv
 from ..utils import validate_scaling_factor
 
 
@@ -132,6 +132,8 @@ class FNOBlocks(nn.Module):
         implementation="factorized",
         decomposition_kwargs=dict(),
         enforce_hermitian_symmetry=True,
+        mode_modulation: bool = False,
+        cond_embed_dim: Optional[int] = None,
     ):
         super().__init__()
         if isinstance(n_modes, int):
@@ -172,6 +174,15 @@ class FNOBlocks(nn.Module):
         else:
             self.non_linearity = non_linearity
 
+        if mode_modulation:
+            if cond_embed_dim is None:
+                raise ValueError("cond_embed_dim is required when mode_modulation=True")
+            conv_module = ConditionalSpectralConv
+            cond_kwargs = {"condition_embedding_channels": cond_embed_dim}
+        else:
+            cond_kwargs = {}
+        self._mode_modulation = mode_modulation
+
         # One conv per layer. Only resolution_scaling_factor varies by layer index
         self.convs = nn.ModuleList(
             [
@@ -194,12 +205,12 @@ class FNOBlocks(nn.Module):
                     fno_block_precision=fno_block_precision,
                     decomposition_kwargs=decomposition_kwargs,
                     complex_data=complex_data,
-                    # Only SpectralConv (and subclasses) accept enforce_hermitian_symmetry. Others ignore it
                     **(
                         {"enforce_hermitian_symmetry": enforce_hermitian_symmetry}
                         if issubclass(conv_module, SpectralConv)
                         else {}
                     ),
+                    **cond_kwargs,
                 )
                 for i in range(n_layers)
             ]
