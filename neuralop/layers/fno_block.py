@@ -308,6 +308,15 @@ class FNOBlocks(nn.Module):
         if self.complex_data and self.norm is not None:
             self.norm = nn.ModuleList([ComplexValued(x) for x in self.norm])
 
+        # FiLM projectors: Linear(cond_embed_dim, 2*out_channels) * (n_layers * 2).
+        # Index 2*i is applied after the spectral conv; index 2*i+1 after the channel MLP.
+        if cond_embed_dim is not None:
+            self.film_proj = nn.ModuleList(
+                [nn.Linear(cond_embed_dim, 2 * out_channels) for _ in range(n_layers * 2)]
+            )
+        else:
+            self.film_proj = None
+
     def set_ada_in_embeddings(self, *embeddings):
         """Sets the embeddings of each Ada-IN norm layers
 
