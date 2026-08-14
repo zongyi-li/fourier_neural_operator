@@ -1,7 +1,7 @@
 import pytest
 import torch
 from tltorch import FactorizedTensor
-from ..spectral_convolution import SpectralConv
+from ..spectral_convolution import SpectralConv, ConditionalSpectralConv
 
 
 @pytest.mark.parametrize("factorization", ["Dense", "CP", "Tucker", "TT"])
@@ -113,3 +113,68 @@ def test_SpectralConv2(enforce_hermitian_symmetry, dim, spatial_size, modes, res
     assert res.shape == (2, 4, *out_size)
     assert res.dtype == torch.float32
     assert not torch.is_complex(res)
+
+
+# ConditionalSpectralConv tests
+
+@pytest.mark.parametrize("dim", [1, 2, 3])
+@pytest.mark.parametrize("modulation_type", ["real", "complex", "polar"])
+@pytest.mark.parametrize("type_k", ["power", "sinusoidal"])
+def test_conditional_spectral_conv_forward_shape(dim, modulation_type, type_k):
+    torch.manual_seed(0)
+    n_modes = (6,) * dim
+    spatial = (10,) * dim
+    cond_dim = 8
+
+    layer = ConditionalSpectralConv(
+        2, 3, n_modes,
+        condition_embedding_channels=cond_dim,
+        modulation_type=modulation_type,
+        type_k=type_k,
+    )
+    x = torch.randn(2, 2, *spatial)
+    e = torch.randn(2, cond_dim)
+    y = layer(x, condition_embedding=e)
+    assert y.shape == (2, 3, *spatial)
+    assert torch.isfinite(y).all()
+
+def test_conditional_spectral_conv_no_embedding_raises():
+    layer = ConditionalSpectralConv(2, 3, (6, 6), condition_embedding_channels=8)
+    with pytest.raises(ValueError, match="condition_embedding"):
+        layer(torch.randn(2, 2, 10, 10), condition_embedding=None)
+
+def test_conditional_spectral_conv_wrong_width_raises():
+    layer = ConditionalSpectralConv(2, 3, (6, 6), condition_embedding_channels=8)
+    with pytest.raises(ValueError, match="condition_embedding_channels"):
+        layer(torch.randn(2, 2, 10, 10), condition_embedding=torch.randn(2, 5))
+
+def test_conditional_spectral_conv_backward():
+    """ConditionalSpectralConv is affine in x, so analytic grad == finite difference."""
+    torch.manual_seed(0)
+    cond_dim = 6
+    layer = ConditionalSpectralConv(2, 2, (6, 6), condition_embedding_channels=cond_dim, modulation_type="polar")
+    x = torch.randn(2, 2, 8, 8, requires_grad=True)
+    e = torch.randn(2, cond_dim)
+    w = torch.randn(2, 2, 8, 8)
+    v = torch.randn(2, 2, 8, 8)
+    loss = (layer(x, condition_embedding=e) * w).sum()
+    (grad_x,) = torch.autograd.grad(loss, x)
+    analytic = (grad_x * v).sum()
+    eps = 1.0
+    with torch.no_grad():
+        lp = (layer(x + eps * v, condition_embedding=e) * w).sum()
+        lm = (layer(x - eps * v, condition_embedding=e) * w).sum()
+    fd = (lp - lm) / (2 * eps)
+    torch.testing.assert_close(analytic, fd, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("modulation_type", ["real", "complex", "polar"])
+def test_conditional_spectral_conv_all_params_get_grad(modulation_type):
+    torch.manual_seed(0)
+    layer = ConditionalSpectralConv(3, 3, (6, 6), condition_embedding_channels=8,modulation_type=modulation_type)
+    x = torch.randn(2, 3, 10, 10, requires_grad=True)
+    e = torch.randn(2, 8)
+    layer(x, condition_embedding=e).sum().backward()
+    assert x.grad is not None
+    for name, p in layer.named_parameters():
+        assert p.grad is not None, f"no grad for {name}"
