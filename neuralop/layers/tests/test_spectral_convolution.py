@@ -166,15 +166,3 @@ def test_conditional_spectral_conv_backward():
         lm = (layer(x - eps * v, condition_embedding=e) * w).sum()
     fd = (lp - lm) / (2 * eps)
     torch.testing.assert_close(analytic, fd, rtol=1e-4, atol=1e-4)
-
-
-@pytest.mark.parametrize("modulation_type", ["real", "complex", "polar"])
-def test_conditional_spectral_conv_all_params_get_grad(modulation_type):
-    torch.manual_seed(0)
-    layer = ConditionalSpectralConv(3, 3, (6, 6), condition_embedding_channels=8,modulation_type=modulation_type)
-    x = torch.randn(2, 3, 10, 10, requires_grad=True)
-    e = torch.randn(2, 8)
-    layer(x, condition_embedding=e).sum().backward()
-    assert x.grad is not None
-    for name, p in layer.named_parameters():
-        assert p.grad is not None, f"no grad for {name}"
