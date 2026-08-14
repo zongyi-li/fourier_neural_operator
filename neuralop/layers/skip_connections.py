@@ -95,9 +95,9 @@ class SoftGating(nn.Module):
 
 class Flattened1dConv(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size, bias=False):
-        """Flattened3dConv is a Conv-based skip layer for
+        """Flattened1dConv is a Conv-based skip layer for
         input tensors of ndim > 3 (batch, channels, d1, ...) that flattens all dimensions
-        past the batch and channel dims into one dimension, applies the Conv,
+        past the batch and channel dims into one dimension, applies the Conv1d,
         and un-flattens.
 
         Parameters
@@ -109,7 +109,7 @@ class Flattened1dConv(nn.Module):
         kernel_size : int
             kernel_size of Conv1d
         bias : bool, optional
-            bias of Conv3d, by default False
+            bias of Conv1d, by default False
         """
         super().__init__()
         self.conv = nn.Conv1d(
