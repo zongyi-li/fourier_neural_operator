@@ -334,6 +334,14 @@ class FNOBlocks(nn.Module):
                 for norm, embedding in zip(self.norm, embeddings):
                     norm.set_embedding(embedding)
 
+    @staticmethod
+    def _film(x, proj_out, n_dim):
+        """Apply FiLM: x * (1 + scale) + shift, broadcasting over spatial dims."""
+        scale, shift = proj_out.chunk(2, dim=-1)
+        scale = scale.view(*scale.shape, *([1] * n_dim))
+        shift = shift.view(*shift.shape, *([1] * n_dim))
+        return x * (1 + scale) + shift
+
     def forward(self, x, index=0, output_shape=None):
         if self.preactivation:
             return self.forward_with_preactivation(x, index, output_shape)
