@@ -17,6 +17,10 @@ def resample(x, res_scale, axis, output_shape=None):
     this frequency representation and then applying an inverse FFT, the function achieves smooth,
     alias-free interpolation that preserves the signal’s overall structure.
 
+    For complex-valued inputs, the function uses a full FFT and inverse FFT along the resampled
+    axes to preserve both real and imaginary components. Like the real-valued spectral path,
+    this assumes the resampled axes are the final dimensions of ``x``.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -46,6 +50,23 @@ def resample(x, res_scale, axis, output_shape=None):
     else:
         new_size = output_shape
 
+    if x.is_complex():
+        X = torch.fft.fftn(x, norm="forward", dim=axis)
+
+        new_fft_size = list(new_size)
+        new_fft_size_c = [min(i, j) for (i, j) in zip(new_fft_size, X.shape[-len(axis) :])]
+        out_fft = torch.zeros(
+            [x.shape[0], x.shape[1], *new_fft_size], device=x.device, dtype=X.dtype
+        )
+
+        mode_indexing = [((None, (m + 1) // 2), (-(m // 2), None)) for m in new_fft_size_c]
+        for boundaries in itertools.product(*mode_indexing):
+            idx_tuple = [slice(None), slice(None)] + [slice(*b) for b in boundaries]
+
+            idx_tuple = tuple(idx_tuple)
+            out_fft[idx_tuple] = X[idx_tuple]
+        return torch.fft.ifftn(out_fft, s=new_size, norm="forward", dim=axis)
+
     if len(axis) == 1:
         return F.interpolate(x, size=new_size[0], mode="linear", align_corners=True)
     if len(axis) == 2:
@@ -60,7 +81,7 @@ def resample(x, res_scale, axis, output_shape=None):
         [x.shape[0], x.shape[1], *new_fft_size], device=x.device, dtype=torch.cfloat
     )
 
-    mode_indexing = [((None, m//2), (-m//2, None)) for m in new_fft_size_c[:-1]] + [((None, new_fft_size_c[-1]), )]
+    mode_indexing = [((None, (m + 1) // 2), (-(m // 2), None)) for m in new_fft_size_c[:-1]] + [((None, new_fft_size_c[-1]), )]
     for i, boundaries in enumerate(itertools.product(*mode_indexing)):
         idx_tuple = [slice(None), slice(None)] + [slice(*b) for b in boundaries]
 

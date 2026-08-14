@@ -1,4 +1,5 @@
 from .fno import TFNO, FNO
+from .lattice_fno import LatticeFNO
 
 # only import SFNO if torch_harmonics is built locally
 try:

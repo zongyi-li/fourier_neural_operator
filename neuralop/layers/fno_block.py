@@ -112,6 +112,14 @@ class FNOBlocks(nn.Module):
         Module to use for convolutions in FNO block, by default SpectralConv
     joint_factorization : bool, optional
         Whether to factorize all spectralConv weights as one tensor, by default False
+    index_set : IndexSet or None, optional
+        Fourier modes to keep and learn weights for. If None, the layer uses a
+        ``HyperRectangleIndexSet`` with storage capacity derived from
+        ``max_n_modes`` when given, and otherwise from ``n_modes``.
+    spectral_transform : object or None, optional
+        Spectral transform backend. If None, the layer uses the default
+        regular-grid FFT backend, ``RegularGridFFT``. Custom transforms must
+        provide ``forward_transform``, ``inverse_transform``.
     fixed_rank_modes : bool, optional
         Fixed_rank_modes parameter for SpectralConv, by default False
     implementation : str, optional
@@ -161,6 +169,8 @@ class FNOBlocks(nn.Module):
         factorization=None,
         rank=1.0,
         conv_module=SpectralConv,
+        index_set=None,
+        spectral_transform=None,
         fixed_rank_modes=False,
         implementation="factorized",
         decomposition_kwargs=dict(),
@@ -171,10 +181,15 @@ class FNOBlocks(nn.Module):
             n_modes = [n_modes]
         self._n_modes = n_modes
         self.n_dim = len(n_modes)
+        self.data_dim = (
+            spectral_transform.data_dim
+            if spectral_transform is not None
+            else self.n_dim
+        )
 
         self.resolution_scaling_factor: Union[
             None, List[List[float]]
-        ] = validate_scaling_factor(resolution_scaling_factor, self.n_dim, n_layers)
+        ] = validate_scaling_factor(resolution_scaling_factor, self.data_dim, n_layers)
 
         self.max_n_modes = max_n_modes
         self.fno_block_precision = fno_block_precision
@@ -199,6 +214,8 @@ class FNOBlocks(nn.Module):
         self.preactivation = preactivation
         self.ada_in_features = ada_in_features
         self.enforce_hermitian_symmetry = enforce_hermitian_symmetry
+        self.index_set = index_set
+        self.spectral_transform = spectral_transform
 
         # apply real nonlin if data is real, otherwise CGELU
         if self.complex_data:
@@ -230,7 +247,11 @@ class FNOBlocks(nn.Module):
                     complex_data=complex_data,
                     # Only SpectralConv (and subclasses) accept enforce_hermitian_symmetry. Others ignore it
                     **(
-                        {"enforce_hermitian_symmetry": enforce_hermitian_symmetry}
+                        {
+                            "index_set": index_set,
+                            "spectral_transform": spectral_transform,
+                            "enforce_hermitian_symmetry": enforce_hermitian_symmetry,
+                        }
                         if issubclass(conv_module, SpectralConv)
                         else {}
                     ),
@@ -262,7 +283,7 @@ class FNOBlocks(nn.Module):
                         self.in_channels,
                         self.out_channels,
                         skip_type=fno_skip,
-                        n_dim=self.n_dim,
+                        n_dim=self.data_dim,
                     )
                     for _ in range(n_layers)
                 ]
@@ -283,7 +304,7 @@ class FNOBlocks(nn.Module):
                         in_channels=self.out_channels,
                         hidden_channels=round(self.out_channels * channel_mlp_expansion),
                         dropout=channel_mlp_dropout,
-                        n_dim=self.n_dim,
+                        n_dim=self.data_dim,
                     )
                     for _ in range(n_layers)
                 ]
@@ -299,7 +320,7 @@ class FNOBlocks(nn.Module):
                             self.in_channels,
                             self.out_channels,
                             skip_type=channel_mlp_skip,
-                            n_dim=self.n_dim,
+                            n_dim=self.data_dim,
                         )
                         for _ in range(n_layers)
                     ]
@@ -330,7 +351,7 @@ class FNOBlocks(nn.Module):
         elif norm == "batch_norm":
             self.norm = nn.ModuleList(
                 [
-                    BatchNorm(n_dim=self.n_dim, num_features=self.out_channels)
+                    BatchNorm(n_dim=self.data_dim, num_features=self.out_channels)
                     for _ in range(n_layers * self.n_norms)
                 ]
             )

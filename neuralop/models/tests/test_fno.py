@@ -5,9 +5,29 @@ import torch
 import torch.nn.functional as F
 from tensorly import tenalg
 
-from neuralop.models import FNO
+from neuralop.models import FNO, LatticeFNO
 
 tenalg.set_backend("einsum")
+
+
+def test_lattice_fno_helper_accepts_integer_output_shape():
+    z = torch.tensor([1, 5])
+    model = LatticeFNO(
+        n=17,
+        z=z,
+        n_modes=(3, 3),
+        in_channels=1,
+        out_channels=1,
+        hidden_channels=4,
+        n_layers=2,
+        lifting_channel_ratio=1,
+        projection_channel_ratio=1,
+    )
+    x = torch.randn(2, 1, 17)
+
+    out = model(x, output_shape=31)
+
+    assert out.shape == (2, 1, 31)
 
 
 @pytest.mark.parametrize("n_dim", [1, 2, 3, 4])

@@ -4,6 +4,8 @@ from typing import List
 import torch
 from torch import nn
 
+from .lattice import rank1_lattice_points
+
 
 class Embedding(nn.Module, ABC):
     def __init__(self):
@@ -161,6 +163,60 @@ class GridEmbeddingND(nn.Module):
         grids = self.grid(spatial_dims=data.shape[2:], device=data.device, dtype=data.dtype)
         grids = [x.repeat(batch_size, *[1] * (self.dim + 1)) for x in grids]
         out = torch.cat((data, *grids), dim=1)
+        return out
+
+
+class LatticeEmbedding(Embedding):
+    """Append rank-1 lattice coordinates as positional channels.
+
+    Inputs are expected to have shape ``(batch, channels, n)`` where the last
+    dimension follows the rank-1 lattice point order. For generating vector
+    ``z`` and ``n`` lattice points, the appended coordinate channels are
+    ``(j * z mod n) / n`` for ``j = 0, ..., n - 1``. This is meant to be used
+    with ``Rank1LatticeFFT`` when the physical discretization is given by
+    rank-1 lattice points.
+
+    References
+    ----------
+    .. [1] Dilen, J., Keller, A., Kuo, F. Y., Nuyens, D. "Fourier Neural
+        Operators with Rank-1 Lattice Points and Hyperbolic Cross" (2026).
+        https://arxiv.org/abs/2606.08871.
+    """
+
+    def __init__(self, in_channels: int, z: torch.Tensor):
+        super().__init__()
+        self.in_channels = in_channels
+        self.register_buffer("z", torch.as_tensor(z, dtype=torch.long))
+        self._coordinates = None
+        self._n = None
+
+    @property
+    def out_channels(self):
+        return self.in_channels + self.z.numel()
+
+    def coordinates(self, n, device, dtype):
+        if (
+            self._coordinates is None
+            or self._n != n
+            or self._coordinates.device != device
+            or self._coordinates.dtype != dtype
+        ):
+            lattice = rank1_lattice_points(self.z, n, device=device, dtype=dtype)
+            self._coordinates = lattice.T.unsqueeze(0)
+            self._n = n
+        return self._coordinates
+
+    def forward(self, data, batched=True):
+        if not batched and data.ndim == 2:
+            data = data.unsqueeze(0)
+        batch_size = data.shape[0]
+        coordinates = self.coordinates(data.shape[-1], data.device, data.dtype)
+        out = torch.cat(
+            (data, coordinates.expand(batch_size, -1, -1)),
+            dim=1,
+        )
+        if not batched and batch_size == 1:
+            return out.squeeze(0)
         return out
 
 
