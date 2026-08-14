@@ -342,13 +342,13 @@ class FNOBlocks(nn.Module):
         shift = shift.view(*shift.shape, *([1] * n_dim))
         return x * (1 + scale) + shift
 
-    def forward(self, x, index=0, output_shape=None):
+    def forward(self, x, index=0, output_shape=None, cond_emb=None):
         if self.preactivation:
-            return self.forward_with_preactivation(x, index, output_shape)
+            return self.forward_with_preactivation(x, index, output_shape, cond_emb=cond_emb)
         else:
-            return self.forward_with_postactivation(x, index, output_shape)
+            return self.forward_with_postactivation(x, index, output_shape, cond_emb=cond_emb)
 
-    def forward_with_postactivation(self, x, index=0, output_shape=None):
+    def forward_with_postactivation(self, x, index=0, output_shape=None, cond_emb=None):
         if self.fno_skips is not None:
             x_skip_fno = self.fno_skips[index](x)
             x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
@@ -363,10 +363,16 @@ class FNOBlocks(nn.Module):
             else:
                 x = torch.tanh(x)
 
-        x_fno = self.convs[index](x, output_shape=output_shape)
+        if self._mode_modulation:
+            x_fno = self.convs[index](x, output_shape=output_shape, condition_embedding=cond_emb)
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
 
         if self.norm is not None:
             x_fno = self.norm[self.n_norms * index](x_fno)
+
+        if self.film_proj is not None and cond_emb is not None:
+            x_fno = self._film(x_fno, self.film_proj[2 * index](cond_emb), self.n_dim)
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
@@ -382,12 +388,15 @@ class FNOBlocks(nn.Module):
         if self.norm is not None:
             x = self.norm[self.n_norms * index + 1](x)
 
+        if self.film_proj is not None and cond_emb is not None:
+            x = self._film(x, self.film_proj[2 * index + 1](cond_emb), self.n_dim)
+
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
 
         return x
 
-    def forward_with_preactivation(self, x, index=0, output_shape=None):
+    def forward_with_preactivation(self, x, index=0, output_shape=None, cond_emb=None):
         # Apply non-linear activation (and norm)
         # before this block's convolution/forward pass:
         x = self.non_linearity(x)
@@ -409,7 +418,13 @@ class FNOBlocks(nn.Module):
             else:
                 x = torch.tanh(x)
 
-        x_fno = self.convs[index](x, output_shape=output_shape)
+        if self._mode_modulation:
+            x_fno = self.convs[index](x, output_shape=output_shape, condition_embedding=cond_emb)
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
+
+        if self.film_proj is not None and cond_emb is not None:
+            x_fno = self._film(x_fno, self.film_proj[2 * index](cond_emb), self.n_dim)
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
@@ -418,6 +433,9 @@ class FNOBlocks(nn.Module):
 
         if self.norm is not None:
             x = self.norm[self.n_norms * index + 1](x)
+
+        if self.film_proj is not None and cond_emb is not None:
+            x = self._film(x, self.film_proj[2 * index + 1](cond_emb), self.n_dim)
 
         if self.use_channel_mlp:
             if self.channel_mlp_skips is not None:
