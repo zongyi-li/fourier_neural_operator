@@ -1,5 +1,5 @@
 from functools import partialmethod
-from typing import Tuple, List, Union, Literal
+from typing import Optional, Tuple, List, Union, Literal
 
 Number = Union[float, int]
 
@@ -207,6 +207,8 @@ class FNO(BaseModel, name="FNO"):
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
+        cond_embed_dim: Optional[int] = None,
+        mode_modulation: bool = False,
     ):
         if decomposition_kwargs is None:
             decomposition_kwargs = {}
@@ -315,6 +317,8 @@ class FNO(BaseModel, name="FNO"):
             conv_module=conv_module,
             n_layers=n_layers,
             enforce_hermitian_symmetry=enforce_hermitian_symmetry,
+            cond_embed_dim=cond_embed_dim,
+            mode_modulation=mode_modulation,
         )
 
         ## Lifting layer
@@ -444,6 +448,57 @@ def partialclass(new_name, cls, *args, **kwargs):
             "forward": cls.forward,
         },
     )
+
+
+class ConditionalFNO(FNO, name="ConditionalFNO"):
+    """FNO with parameter conditioning via spectral modulation and adaptive normalization FiLM.
+    Extends FNO by accepting a pre-computed conditioning embedding cond_emb in forward.
+
+    Parameters
+    ----------
+    cond_embed_dim : int
+        Dimension of the conditioning embedding supplied to forward.
+
+    mode_modulation : bool, optional
+        If True, use ConditionalSpectralConv to apply per-mode spectral
+        modulation. Requires cond_embed_dim. Default: False.
+
+    All other parameters are inherited from FNO.
+    """
+
+    def __init__(self, *args, cond_embed_dim: int, mode_modulation: bool = False, **kwargs):
+        super().__init__(*args, cond_embed_dim=cond_embed_dim, mode_modulation=mode_modulation, **kwargs)
+
+    def forward(self, x, output_shape=None, cond_emb=None, **kwargs):
+        if kwargs:
+            warnings.warn(
+                f"ConditionalFNO.forward() received unexpected keyword arguments: {list(kwargs.keys())}. "
+                "These arguments will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if output_shape is None:
+            output_shape = [None] * self.n_layers
+        elif isinstance(output_shape, tuple):
+            output_shape = [None] * (self.n_layers - 1) + [output_shape]
+
+        if self.positional_embedding is not None:
+            x = self.positional_embedding(x)
+
+        x = self.lifting(x)
+
+        if self.domain_padding is not None:
+            x = self.domain_padding.pad(x)
+
+        for layer_idx in range(self.n_layers):
+            x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx], cond_emb=cond_emb)
+
+        if self.domain_padding is not None:
+            x = self.domain_padding.unpad(x)
+
+        x = self.projection(x)
+        return x
 
 
 class TFNO(FNO):
