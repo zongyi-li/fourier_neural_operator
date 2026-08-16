@@ -9,6 +9,7 @@ import tensorly as tl
 from tensorly.plugins import use_opt_einsum
 from tltorch.factorized_tensors.core import FactorizedTensor
 
+from .channel_mlp import ChannelMLP
 from .einsum_utils import einsum_complexhalf
 from .base_spectral_conv import BaseSpectralConv
 from .resample import resample
@@ -414,18 +415,40 @@ class SpectralConv(BaseSpectralConv):
             n_modes[-1] = n_modes[-1] // 2 + 1
         self._n_modes = n_modes
 
-    def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None):
-        """Generic forward pass for the Factorized Spectral Conv
+
+    def _modulate_modes(self, x_hat, modes, condition_embedding=None):
+        """Hook called on the kept spectral modes before the weight contraction.
+        The base implementation does nothing. Override in a subclass to apply
+        per-mode conditioning.
+        
+        See ConditionalSpectralConv)
 
         Parameters
         ----------
-        x : torch.Tensor
-            input activation of size (batch_size, channels, d1, ..., dN)
+        x_hat : torch.Tensor
+            Kept Fourier modes, shape (B, in_channels, *modes_shape).
+        modes: tuple of int
+            Shape of the kept-mode grid (same as x_hat.shape[2:]).
+        condition_embedding: torch.Tensor or None
+            Per-sample conditioning vector, shape (B, D).
 
         Returns
         -------
-        tensorized_spectral_conv(x)
+        torch.Tensor
+            Modulated modes, same shape as x_hat.
         """
+        return x_hat
+
+    def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None):
+        return self._forward_impl(x, output_shape=output_shape)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        output_shape: Optional[Tuple[int]] = None,
+        condition_embedding: Optional[torch.Tensor] = None,
+    ):
+        """Shared implementation used by forward and ConditionalSpectralConv.forward."""
         batchsize, channels, *mode_sizes = x.shape
 
         fft_size = list(mode_sizes)
@@ -517,9 +540,10 @@ class SpectralConv(BaseSpectralConv):
             slices_x[-1] = slice(None)
 
         slices_x = tuple(slices_x)
-        out_fft[slices_x] = self._contract(
-            x[slices_x], weight, separable=self.separable
+        x_kept = self._modulate_modes(
+            x[slices_x], tuple(weight.shape[weight_start_idx:]), condition_embedding
         )
+        out_fft[slices_x] = self._contract(x_kept, weight, separable=self.separable)
 
         if self.resolution_scaling_factor is not None and output_shape is None:
             mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])
@@ -566,5 +590,143 @@ class SpectralConv(BaseSpectralConv):
 
         if self.bias is not None:
             x = x + self.bias
-          
+
         return x
+
+
+class ConditionalSpectralConv(SpectralConv):
+    """SpectralConv with per-mode conditioning via a learned (e, k) -> factor projection.
+
+    Inherits the full spectral convolution from SpectralConv. The only
+    addition is the _modulate_modes method, which multiplies the kept Fourier modes
+    by a per-mode complex factor derived from the conditioning embedding e
+    and a positional embedding of the mode indices phi_k.
+
+    Parameters
+    ----------
+    *args
+        Positional arguments forwarded to SpectralConv.
+
+    condition_embedding_channels : int
+        Width of the conditioning embedding e passed to forward.
+    modulation_type : {'real', 'complex', 'polar'}, optional
+        Output type of the per-mode factor. 'real' is a positive scalar,
+        'complex' is an unconstrained complex number, 'polar' is a
+        unit-magnitude phase rotation exp(i*theta). By default 'polar'.
+    k_embed_dim : int, optional
+        Dimension of the per-axis frequency-mode positional embedding. By default 32.
+    type_k : {'power', 'sinusoidal'}, optional
+        How to embed the mode index. By default 'power'.
+    hidden_channels : int, optional
+        Width of the hidden layer in the projection MLP. By default 64.
+    **kwargs
+        Keyword arguments forwarded to SpectralConv.
+    """
+
+    def __init__(
+        self,
+        *args,
+        condition_embedding_channels: int,
+        modulation_type: str = "polar",
+        k_embed_dim: int = 32,
+        type_k: str = "power",
+        hidden_channels: int = 64,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.condition_embedding_channels = condition_embedding_channels
+        self.modulation_type = modulation_type
+        self.k_embed_dim = k_embed_dim
+        self.type_k = type_k
+        self._k_grid_cache = {}
+
+        if type_k == "power":
+            self.register_buffer("k_powers", torch.linspace(-2.0, 0.0, k_embed_dim))
+        elif type_k == "sinusoidal":
+            indices = torch.arange(0, k_embed_dim // 2, dtype=torch.float32)
+            self.register_buffer("k_inv_freqs", 10000.0 ** (-2.0 * indices / k_embed_dim))
+        else:
+            raise ValueError(f"unknown type_k: {type_k!r}. expected 'power' or 'sinusoidal'.")
+
+        in_features = condition_embedding_channels + k_embed_dim * self.order
+        if modulation_type in ("real", "polar"):
+            out_features = self.in_channels
+        elif modulation_type == "complex":
+            out_features = self.in_channels * 2
+        else:
+            raise ValueError(
+                f"unknown modulation_type: {modulation_type!r}. expected 'real', 'complex', or 'polar'."
+            )
+
+        self.modulator = ChannelMLP(
+            in_channels=in_features,
+            out_channels=out_features,
+            hidden_channels=hidden_channels,
+            n_dim=self.order,
+        )
+
+    def _embed_k(self, shape: Tuple[int, ...], device=None) -> torch.Tensor:
+        cache_key = (shape, device)
+        if cache_key not in self._k_grid_cache:
+            n_dims = len(shape)
+            k_ranges = []
+            for i, Si in enumerate(shape):
+                if i < n_dims - 1:
+                    half = Si // 2
+                    k_ranges.append(torch.arange(-half, Si - half, device=device))
+                else:
+                    k_ranges.append(torch.arange(0, Si, device=device))
+            k_grid = torch.stack(
+                torch.meshgrid(*k_ranges, indexing="ij"), dim=0
+            ).unsqueeze(0)
+            self._k_grid_cache[cache_key] = k_grid
+        k_grid = self._k_grid_cache[cache_key]
+
+        n_dims = len(shape)
+        if self.type_k == "power":
+            sign = torch.sign(k_grid)
+            k_embed = sign.unsqueeze(2) * (
+                k_grid.abs().clamp_min(1.0).unsqueeze(2)
+                ** self.k_powers.view(1, 1, -1, *([1] * n_dims))
+            )
+        else:
+            k_scaled = k_grid.unsqueeze(2) * self.k_inv_freqs.view(
+                1, 1, -1, *([1] * n_dims)
+            )
+            k_embed = torch.cat([torch.sin(k_scaled), torch.cos(k_scaled)], dim=2)
+
+        return k_embed.reshape(1, -1, *shape)
+
+    def _modulate_modes(self, x_hat, modes, condition_embedding):
+        if condition_embedding is None:
+            raise ValueError(
+                "ConditionalSpectralConv requires condition_embedding; got None."
+            )
+        if condition_embedding.shape[1] != self.condition_embedding_channels:
+            raise ValueError(
+                f"condition_embedding width {condition_embedding.shape[1]} does not match "
+                f"condition_embedding_channels={self.condition_embedding_channels}."
+            )
+
+        B = condition_embedding.shape[0]
+        kept_shape = tuple(x_hat.shape[2:])
+        n_kept = len(kept_shape)
+
+        t_feat = condition_embedding.reshape(B, -1, *([1] * n_kept)).expand(B, -1, *kept_shape)
+        k_feat = self._embed_k(kept_shape, device=x_hat.device).expand(B, -1, *kept_shape)
+        mlp_out = self.modulator(torch.cat([t_feat, k_feat], dim=1))
+
+        if self.modulation_type == "real":
+            factor = mlp_out
+        elif self.modulation_type == "complex":
+            factor = torch.complex(mlp_out[:, : self.in_channels], mlp_out[:, self.in_channels :])
+        else:  # polar
+            factor = torch.exp(1j * mlp_out)
+
+        return x_hat * factor
+
+    def forward(self, x, output_shape=None, *, condition_embedding):
+        return self._forward_impl(
+            x, output_shape=output_shape, condition_embedding=condition_embedding
+        )

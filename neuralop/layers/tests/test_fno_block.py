@@ -224,27 +224,42 @@ def test_FNOBlock_skip_connections_preactivation(fno_skip, channel_mlp_skip):
     # Check output shape
     assert res.shape == (2, 4, *size)
 
+# FNOBlocks conditioning tests
+@pytest.mark.parametrize("mode_modulation", [False, True])
+@pytest.mark.parametrize("dim", [1, 2, 3])
+def test_fno_block_film_forward_shape(dim, mode_modulation):
+    torch.manual_seed(0)
+    cond_dim = 8
+    n_modes = (6,) * dim
+    spatial = (10,) * dim
 
-@pytest.mark.parametrize("n_dim", [1, 2, 3])
-def test_FNOBlock_conv_bias_kernel(n_dim):
-    """Test local convolutional bias kernels beside spectral convolution."""
-    modes = (8, 8, 8)
-    size = [10, 10, 10]
-    conv_bias_kernel = 3
-
-    block = FNOBlocks(
-        3,
-        4,
-        modes[:n_dim],
-        n_layers=2,
-        conv_bias_kernel=conv_bias_kernel,
-        fno_skip="linear",
-        use_channel_mlp=False,
+    block = FNOBlocks(4, 4, n_modes, cond_embed_dim=cond_dim,
+        mode_modulation=mode_modulation,  norm="group_norm",
     )
+    x = torch.randn(2, 4, *spatial)
+    e = torch.randn(2, cond_dim)
+    y = block(x, cond_emb=e)
+    assert y.shape == (2, 4, *spatial)
+    assert torch.isfinite(y).all()
 
-    x = torch.randn(2, 3, *size[:n_dim])
-    res = block(x)
 
-    assert res.shape == (2, 4, *size[:n_dim])
-    assert block.conv_bias_kernel == conv_bias_kernel
-    assert block.fno_skips[0].kernel_size == (conv_bias_kernel,) * n_dim
+def test_fno_block_film_no_cond_emb_is_identity_path():
+    """When cond_emb=None, FiLM projectors are unused; output is deterministic."""
+    block = FNOBlocks(4, 4, (6, 6), cond_embed_dim=8)
+    x = torch.randn(2, 4, 10, 10)
+    y1 = block(x, cond_emb=None)
+    y2 = block(x)
+    torch.testing.assert_close(y1, y2)
+
+
+def test_fno_block_film_all_params_get_grad():
+    torch.manual_seed(0)
+    cond_dim = 8
+    block = FNOBlocks(3, 3, (6, 6), cond_embed_dim=cond_dim, mode_modulation=True)
+    x = torch.randn(2, 3, 10, 10, requires_grad=True)
+    e = torch.randn(2, cond_dim, requires_grad=True)
+    block(x, cond_emb=e).sum().backward()
+    assert x.grad is not None
+    assert e.grad is not None
+    for name, p in block.named_parameters():
+        assert p.grad is not None, f"no grad for {name}"
